@@ -328,7 +328,9 @@ impl Parser {
             // SGR (Select Graphic Rendition)
             b'm' => Parser::dispatch_sgr(&params),
             // CUU (Cursor Up)
-            b'A' => vec![Action::CursorUp(params.first().copied().unwrap_or(1) as usize)],
+            b'A' => vec![Action::CursorUp(
+                params.first().copied().unwrap_or(1) as usize
+            )],
             // CPL (Cursor Previous Line): up n lines and to column 0
             b'F' => vec![
                 Action::CursorUp(params.first().copied().unwrap_or(1) as usize),
@@ -696,10 +698,7 @@ mod tests {
     fn test_parse_multibyte_utf8() {
         let mut parser = Parser::new();
         // 2-byte and 3-byte sequences must decode to single scalar values.
-        assert_eq!(
-            parser.parse_bytes("á".as_bytes()),
-            vec![Action::Write('á')]
-        );
+        assert_eq!(parser.parse_bytes("á".as_bytes()), vec![Action::Write('á')]);
         assert_eq!(
             parser.parse_bytes("\u{e0b0}".as_bytes()),
             vec![Action::Write('\u{e0b0}')]
