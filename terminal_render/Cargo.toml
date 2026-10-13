@@ -1,0 +1,21 @@
+[package]
+name = "terminal_render"
+version = "0.1.0"
+edition = "2021"
+description = "GPU rendering pipeline: fonts, glyphs, atlas, renderer"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+terminal_core = { path = "../terminal_core" }
+
+# Rendering
+wgpu = { workspace = true }
+fontdb = { workspace = true }
+swash = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }

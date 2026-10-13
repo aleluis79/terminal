@@ -1,0 +1,27 @@
+[package]
+name = "terminal_gui"
+version = "0.1.0"
+edition = "2021"
+description = "GUI layer: windows, tabs, splits, events, clipboard"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+terminal_core = { path = "../terminal_core" }
+terminal_config = { path = "../terminal_config" }
+terminal_pty = { path = "../terminal_pty" }
+terminal_render = { path = "../terminal_render" }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# GUI
+winit = { workspace = true }
+wgpu = { workspace = true }
+pollster = "0.4"
+
+[dev-dependencies]
+rstest = { workspace = true }

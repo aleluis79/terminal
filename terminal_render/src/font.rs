@@ -1,0 +1,261 @@
+//! Font loading and management with fontdb.
+//!
+//! This module handles:
+//! - Font database initialization (fontdb)
+//! - Font family loading and fallback
+//! - Font size configuration
+//! - Access to raw face data for swash (metrics, glyph rasterization)
+
+use fontdb::Database;
+
+/// Configuration for font loading.
+#[derive(Debug, Clone)]
+pub struct FontConfig {
+    /// Font family name (e.g., `JetBrains Mono`, `Fira Code`).
+    pub family: String,
+    /// Font size in points.
+    pub size: f32,
+    /// Whether to load system fonts.
+    pub load_system_fonts: bool,
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            family: "JetBrains Mono".to_string(),
+            size: 14.0,
+            load_system_fonts: true,
+        }
+    }
+}
+
+/// Handle to a loaded font face.
+#[derive(Debug, Clone)]
+pub struct FontHandle {
+    /// The underlying fontdb database.
+    pub db: Database,
+    /// The face ID of the loaded font.
+    pub face_id: fontdb::ID,
+    /// The configured font size in points.
+    pub size: f32,
+}
+
+impl FontHandle {
+    /// Create a new font handle from configuration.
+    ///
+    /// Loads the specified font family from system fonts or the
+    /// provided font bytes. Falls back to a monospace font if
+    /// the requested family is not found.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no fonts are available in the system.
+    pub fn new(config: &FontConfig) -> Self {
+        let mut db = Database::new();
+
+        // Load system fonts if configured
+        if config.load_system_fonts {
+            db.load_system_fonts();
+        }
+
+        // Query for the requested font family
+        let face_id = db
+            .query(&fontdb::Query {
+                families: &[fontdb::Family::Name(&config.family)],
+                weight: fontdb::Weight::NORMAL,
+                stretch: fontdb::Stretch::Normal,
+                style: fontdb::Style::Normal,
+            })
+            .or_else(|| {
+                // Fallback: use an explicitly monospaced face. Note that
+                // `Family::Monospace` resolves by configured family name, not by
+                // the `monospaced` flag, so it is unreliable here.
+                eprintln!(
+                    "Font '{}' not found, falling back to default monospace",
+                    config.family
+                );
+                db.faces().find(|f| f.monospaced).map(|f| f.id)
+            })
+            .or_else(|| {
+                // Last resort: use any available font
+                db.faces().next().map(|f| f.id)
+            })
+            .expect("No fonts available");
+
+        Self {
+            db,
+            face_id,
+            size: config.size,
+        }
+    }
+
+    /// Get the font size in pixels for the given DPI.
+    pub fn size_in_pixels(&self, dpi: f32) -> f32 {
+        // Standard DPI is 72 DPI for font points
+        self.size * dpi / 72.0
+    }
+
+    /// Font size in pixels assuming a 96 DPI display.
+    pub fn pixel_size(&self) -> f32 {
+        self.size_in_pixels(96.0)
+    }
+
+    /// Run a closure with the raw face data and its face index.
+    ///
+    /// Returns `None` if the face data is unavailable.
+    pub fn with_face_data<R>(&self, f: impl FnOnce(&[u8], u32) -> R) -> Option<R> {
+        self.db.with_face_data(self.face_id, f)
+    }
+
+    /// Map a character to a glyph id in this font (0 if unmapped).
+    pub fn glyph_id(&self, ch: char) -> u16 {
+        self.with_face_data(|data, index| {
+            swash::FontRef::from_index(data, index as usize)
+                .map_or(0, |font| font.charmap().map(ch))
+        })
+        .unwrap_or(0)
+    }
+
+    /// Get scaled font metrics for the configured size.
+    pub fn metrics(&self) -> FontMetrics {
+        let ppem = self.pixel_size();
+        let advance = self.advance_width(ppem);
+
+        let scaled = self
+            .with_face_data(|data, index| {
+                swash::FontRef::from_index(data, index as usize)
+                    .map(|font| font.metrics(&[]).scale(ppem))
+            })
+            .flatten();
+
+        match scaled {
+            Some(m) => FontMetrics {
+                ascent: m.ascent,
+                descent: m.descent,
+                line_gap: m.leading,
+                advance_width: advance.unwrap_or_else(|| m.average_width.max(1.0)),
+            },
+            None => FontMetrics {
+                ascent: ppem * 0.8,
+                descent: ppem * 0.2,
+                line_gap: 0.0,
+                advance_width: advance.unwrap_or(ppem * 0.6),
+            },
+        }
+    }
+
+    /// Advance width (in pixels) of a representative glyph, scaled to `ppem`.
+    fn advance_width(&self, ppem: f32) -> Option<f32> {
+        self.with_face_data(|data, index| {
+            let font = swash::FontRef::from_index(data, index as usize)?;
+            let units_per_em = f32::from(font.metrics(&[]).units_per_em);
+            if units_per_em == 0.0 {
+                return None;
+            }
+            let glyph_id = font.charmap().map('M');
+            Some(font.glyph_metrics(&[]).advance_width(glyph_id) * ppem / units_per_em)
+        })
+        .flatten()
+        .filter(|advance| *advance > 0.0)
+    }
+}
+
+/// Font metrics for shaping and layout.
+#[derive(Debug, Clone, Copy)]
+pub struct FontMetrics {
+    /// Distance from baseline to ascent.
+    pub ascent: f32,
+    /// Distance from baseline to descent.
+    pub descent: f32,
+    /// Gap between lines.
+    pub line_gap: f32,
+    /// Width of a standard character.
+    pub advance_width: f32,
+}
+
+/// Character Level Shift for ligature support.
+///
+/// Some ligatures (like "fi", "fl") combine multiple characters
+/// into a single glyph. CLS tracks the offset for each character
+/// in a ligature cluster.
+#[derive(Debug, Clone, Copy)]
+pub struct CharacterLevelShift {
+    /// The character position within the cluster.
+    pub position: usize,
+    /// Total number of characters in the cluster.
+    pub total: usize,
+    /// The glyph advance width for this character.
+    pub advance: f32,
+}
+
+impl CharacterLevelShift {
+    /// Create a new CLS entry.
+    pub fn new(position: usize, total: usize, advance: f32) -> Self {
+        Self {
+            position,
+            total,
+            advance,
+        }
+    }
+
+    /// Get the horizontal offset for this character.
+    #[expect(clippy::cast_precision_loss)]
+    pub fn offset(&self) -> f32 {
+        // Distribute the total advance evenly across cluster members
+        let total_advance = self.advance * self.total as f32;
+        (self.position as f32 * total_advance) / self.total as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_font_config_default() {
+        let config = FontConfig::default();
+        assert_eq!(config.family, "JetBrains Mono");
+        assert!((config.size - 14.0).abs() < f32::EPSILON);
+        assert!(config.load_system_fonts);
+    }
+
+    #[test]
+    fn test_font_handle_creation() {
+        let config = FontConfig::default();
+        let font = FontHandle::new(&config);
+        // Font should have a valid face ID (display is non-zero)
+        let id_str = format!("{}", font.face_id);
+        assert!(!id_str.is_empty());
+        assert!((font.size - 14.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_font_handle_metrics() {
+        let config = FontConfig::default();
+        let font = FontHandle::new(&config);
+        let metrics = font.metrics();
+        // Metrics should be positive
+        assert!(metrics.ascent > 0.0);
+        assert!(metrics.advance_width > 0.0);
+    }
+
+    #[test]
+    fn test_glyph_id_maps_ascii() {
+        let config = FontConfig::default();
+        let font = FontHandle::new(&config);
+        // 'A' must map to a non-zero glyph id in any usable font.
+        assert!(font.glyph_id('A') > 0);
+    }
+
+    #[test]
+    fn test_character_level_shift() {
+        let cls = CharacterLevelShift::new(0, 2, 16.0);
+        assert_eq!(cls.position, 0);
+        assert_eq!(cls.total, 2);
+        assert!((cls.advance - 16.0).abs() < f32::EPSILON);
+        assert!((cls.offset() - 0.0).abs() < f32::EPSILON);
+
+        let cls2 = CharacterLevelShift::new(1, 2, 16.0);
+        assert!((cls2.offset() - 16.0).abs() < f32::EPSILON);
+    }
+}

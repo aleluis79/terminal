@@ -1,0 +1,30 @@
+# ── Rust / Cargo ──────────────────────────────────────────
+/target
+**/target
+Cargo.lock.bak
+
+# ── Rust tooling ──────────────────────────────────────────
+*.pdb
+*.profraw
+*.profraw.*
+tarpaulin-report.html
+
+# ── Editores y sistemas operativos ────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ── Logs y artefactos locales ─────────────────────────────
+*.log
+trace.*.json
+trace.*.jsonl
+*.sav
+screenshots/*.png
+
+# ── Configuración local (no versionada) ───────────────────
+.env
+.env.*
+!.env.example

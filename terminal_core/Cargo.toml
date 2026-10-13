@@ -1,0 +1,15 @@
+[package]
+name = "terminal_core"
+version = "0.1.0"
+edition = "2021"
+description = "Core terminal engine: grid, parser, state, buffer (no GUI dependencies)"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+terminal_pty = { path = "../terminal_pty" }
+
+[dev-dependencies]
+rstest = { workspace = true }

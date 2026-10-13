@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Format check ──────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Run cargo fmt
+        run: cargo fmt --check
+
+  # ── Linux: test + clippy ─────────────────────────────────
+  linux:
+    name: Linux (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["stable", "nightly"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Run cargo test
+        run: cargo test --workspace
+
+      - name: Run cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  # ── Windows: test + clippy ───────────────────────────────
+  windows:
+    name: Windows (${{ matrix.rust }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["stable"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Run cargo test
+        run: cargo test --workspace
+
+      - name: Run cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  # ── macOS: test + clippy (best-effort, no PTY tests) ─────
+  macos:
+    name: macOS (${{ matrix.rust }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["stable"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Run cargo test
+        run: cargo test --workspace --lib
+
+      - name: Run cargo clippy
+        run: cargo clippy --workspace -- -D warnings

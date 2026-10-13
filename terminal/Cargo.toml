@@ -1,0 +1,37 @@
+[package]
+name = "terminal"
+version = "0.1.0"
+edition = "2021"
+description = "A modern terminal emulator"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "terminal"
+path = "src/main.rs"
+
+[[example]]
+name = "demo_core"
+path = "../examples/demo_core.rs"
+
+[dependencies]
+terminal_core = { path = "../terminal_core" }
+terminal_config = { path = "../terminal_config" }
+terminal_gui = { path = "../terminal_gui" }
+terminal_pty = { path = "../terminal_pty" }
+terminal_render = { path = "../terminal_render" }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+pollster = "0.4"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# GUI / Rendering (for event loop integration)
+winit = { workspace = true }
+wgpu = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

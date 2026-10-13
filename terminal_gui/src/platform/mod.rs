@@ -1,0 +1,1 @@
+//! Stub: platform-specific code.

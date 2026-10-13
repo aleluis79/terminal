@@ -1,0 +1,25 @@
+[package]
+name = "terminal_pty"
+version = "0.1.0"
+edition = "2021"
+description = "PTY abstraction for Unix and Windows ConPTY"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "term", "signal", "ioctl", "fs"] }
+thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+]}
+
+[dev-dependencies]
+rstest = { workspace = true }
