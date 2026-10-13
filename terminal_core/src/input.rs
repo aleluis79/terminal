@@ -87,8 +87,8 @@ pub enum SpecialKey {
 pub fn key_event_to_bytes(event: &KeyEvent) -> Vec<u8> {
     match event {
         KeyEvent::Char { c, ctrl, alt } => {
-            if *ctrl {
-                // Ctrl + char: convert to ASCII control code
+            if *ctrl && c.is_ascii() {
+                // Ctrl + ASCII char: convert to ASCII control code
                 let code = *c as u32;
                 if (0x40..0x60).contains(&code) {
                     // A-Z → 0x01-0x1A
@@ -101,13 +101,15 @@ pub fn key_event_to_bytes(event: &KeyEvent) -> Vec<u8> {
                     vec![(code & 0x1f) as u8]
                 }
             } else if *alt {
-                // Alt + char: ESC + char
+                // Alt + char: ESC followed by the UTF-8 encoded character
                 let mut bytes = vec![0x1b];
-                bytes.push(*c as u8);
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 bytes
             } else {
-                // Plain char
-                vec![*c as u8]
+                // Plain char, encoded as UTF-8 (may be multi-byte, e.g. 'ñ')
+                let mut buf = [0u8; 4];
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
             }
         }
         KeyEvent::Arrow {
@@ -240,6 +242,64 @@ mod tests {
             alt: true,
         };
         assert_eq!(key_event_to_bytes(&event), vec![0x1b, b'a']);
+    }
+
+    #[test]
+    fn test_char_plain_multibyte() {
+        // Non-ASCII characters must be sent as UTF-8, not truncated to a byte.
+        let event = KeyEvent::Char {
+            c: 'ñ',
+            ctrl: false,
+            alt: false,
+        };
+        assert_eq!(key_event_to_bytes(&event), vec![0xc3, 0xb1]);
+    }
+
+    #[test]
+    fn test_char_plain_three_bytes() {
+        let event = KeyEvent::Char {
+            c: '€',
+            ctrl: false,
+            alt: false,
+        };
+        assert_eq!(key_event_to_bytes(&event), vec![0xe2, 0x82, 0xac]);
+    }
+
+    #[test]
+    fn test_char_alt_multibyte() {
+        let event = KeyEvent::Char {
+            c: 'á',
+            ctrl: false,
+            alt: true,
+        };
+        assert_eq!(key_event_to_bytes(&event), vec![0x1b, 0xc3, 0xa1]);
+    }
+
+    #[test]
+    fn test_char_ctrl_non_ascii_is_utf8() {
+        // Ctrl only maps to control codes for ASCII; otherwise send the char.
+        let event = KeyEvent::Char {
+            c: 'ñ',
+            ctrl: true,
+            alt: false,
+        };
+        assert_eq!(key_event_to_bytes(&event), vec![0xc3, 0xb1]);
+    }
+
+    #[test]
+    fn test_char_bytes_roundtrip_through_parser() {
+        // What the keyboard produces must decode back to the same character.
+        let event = KeyEvent::Char {
+            c: 'ñ',
+            ctrl: false,
+            alt: false,
+        };
+        let bytes = key_event_to_bytes(&event);
+        let mut parser = crate::parser::Parser::new();
+        assert_eq!(
+            parser.parse_bytes(&bytes),
+            vec![crate::parser::Action::Write('ñ')]
+        );
     }
 
     #[test]

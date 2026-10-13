@@ -34,6 +34,9 @@ pub struct WindowConfig {
     /// Window opacity (0.0 = transparent, 1.0 = opaque).
     #[serde(default = "default_opacity")]
     pub opacity: f32,
+    /// Start with the window maximized.
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 impl Default for WindowConfig {
@@ -42,6 +45,7 @@ impl Default for WindowConfig {
             title: default_title(),
             dimensions: Dimensions::default(),
             opacity: default_opacity(),
+            maximized: false,
         }
     }
 }
@@ -91,14 +95,23 @@ impl Default for FontConfig {
 }
 
 /// Cursor configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CursorConfig {
     /// Cursor style.
     #[serde(default)]
     pub style: CursorStyle,
     /// Cursor blink interval in milliseconds (0 = disabled).
-    #[serde(default)]
+    #[serde(default = "default_blink_interval")]
     pub blink_interval: u64,
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self {
+            style: CursorStyle::default(),
+            blink_interval: default_blink_interval(),
+        }
+    }
 }
 
 /// Cursor style.
@@ -280,6 +293,10 @@ fn default_font_size() -> f32 {
     14.0
 }
 
+fn default_blink_interval() -> u64 {
+    500
+}
+
 fn default_ligatures() -> bool {
     true
 }
@@ -381,6 +398,29 @@ mod tests {
         let toml = toml::to_string(&config).unwrap();
         let parsed: Config = toml::from_str(&toml).unwrap();
         assert_eq!(config, parsed);
+    }
+
+    #[test]
+    fn test_cursor_config_defaults_and_parse() {
+        let config = Config::default();
+        assert_eq!(config.cursor.style, CursorStyle::Block);
+        assert_eq!(config.cursor.blink_interval, 500);
+
+        // The cursor section is parsed, including a disabled blink (0).
+        let parsed: Config = toml::from_str("[cursor]\nstyle = \"Beam\"\nblink_interval = 0\n")
+            .expect("cursor config should parse");
+        assert_eq!(parsed.cursor.style, CursorStyle::Beam);
+        assert_eq!(parsed.cursor.blink_interval, 0);
+    }
+
+    #[test]
+    fn test_window_maximized_defaults_and_parse() {
+        // Not maximized unless asked for.
+        assert!(!Config::default().window.maximized);
+
+        let parsed: Config =
+            toml::from_str("[window]\nmaximized = true\n").expect("window config should parse");
+        assert!(parsed.window.maximized);
     }
 
     #[test]

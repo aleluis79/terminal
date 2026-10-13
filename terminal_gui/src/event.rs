@@ -85,6 +85,8 @@ pub struct EventProcessor {
     modifiers: ModifiersState,
     /// Mouse selection state.
     selection: SelectionState,
+    /// Whether the left mouse button is currently held down.
+    dragging: bool,
 }
 
 impl Default for EventProcessor {
@@ -100,6 +102,7 @@ impl EventProcessor {
             keymap: Keymap::default(),
             modifiers: ModifiersState::default(),
             selection: SelectionState::default(),
+            dragging: false,
         }
     }
 
@@ -108,9 +111,15 @@ impl EventProcessor {
         self.selection
     }
 
+    /// Whether a selection drag is in progress (left button held).
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
     /// Reset the selection state.
     pub fn reset_selection(&mut self) {
         self.selection = SelectionState::default();
+        self.dragging = false;
     }
 
     /// Convert pixel coordinates to terminal cell coordinates.
@@ -135,7 +144,26 @@ impl EventProcessor {
         (row, col)
     }
 
+    /// Like [`pixel_to_cell`](Self::pixel_to_cell) but clamped to a grid.
+    fn pixel_to_cell_clamped(
+        x: f64,
+        y: f64,
+        cell_width: f64,
+        cell_height: f64,
+        rows: usize,
+        cols: usize,
+    ) -> (usize, usize) {
+        let (row, col) = Self::pixel_to_cell(x, y, cell_width, cell_height);
+        (
+            row.min(rows.saturating_sub(1)),
+            col.min(cols.saturating_sub(1)),
+        )
+    }
+
     /// Process a mouse event for selection.
+    ///
+    /// A selection is anchored on left button press and only becomes visible
+    /// once the mouse moves (drag). Releasing without dragging clears it.
     ///
     /// # Arguments
     ///
@@ -144,10 +172,16 @@ impl EventProcessor {
     /// * `position` - Mouse position in pixels.
     /// * `cell_width` - Width of a single cell in pixels.
     /// * `cell_height` - Height of a single cell in pixels.
+    /// * `rows` - Number of rows in the grid (for clamping).
+    /// * `cols` - Number of columns in the grid (for clamping).
     ///
     /// # Returns
     ///
     /// A `MouseEvent` with selection state.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mouse event needs position, cell size and grid size"
+    )]
     pub fn process_mouse_event(
         &mut self,
         button: MouseButton,
@@ -155,14 +189,24 @@ impl EventProcessor {
         position: (f64, f64),
         cell_width: f64,
         cell_height: f64,
+        rows: usize,
+        cols: usize,
     ) -> MouseEvent {
-        let (row, col) = Self::pixel_to_cell(position.0, position.1, cell_width, cell_height);
+        let (row, col) = Self::pixel_to_cell_clamped(
+            position.0,
+            position.1,
+            cell_width,
+            cell_height,
+            rows,
+            cols,
+        );
 
         match (button, state) {
             (MouseButton::Left, ElementState::Pressed) => {
-                // Start a new selection
+                // Anchor a new selection at the pressed cell.
                 self.selection.start = Some((row, col));
                 self.selection.current = Some((row, col));
+                self.dragging = true;
                 MouseEvent {
                     button,
                     state,
@@ -171,49 +215,69 @@ impl EventProcessor {
                 }
             }
             (MouseButton::Left, ElementState::Released) => {
-                // End selection
-                let selection_active = self.selection.is_active();
-                // Keep selection for potential copy, but mark as released
+                self.dragging = false;
+                // A plain click (no drag) clears the selection instead of
+                // leaving a one-cell highlight stuck on screen.
+                if self.selection.start == self.selection.current {
+                    self.selection = SelectionState::default();
+                }
                 MouseEvent {
                     button,
                     state,
                     position,
-                    selection_active,
+                    selection_active: self.selection.is_active(),
                 }
             }
             (_, ElementState::Released) => {
-                // Release any selection on other button release
-                if self.selection.is_active() {
-                    self.selection.current = None;
-                }
+                self.dragging = false;
                 MouseEvent {
                     button,
                     state,
                     position,
-                    selection_active: false,
+                    selection_active: self.selection.is_active(),
                 }
             }
             _ => MouseEvent {
                 button,
                 state,
                 position,
-                selection_active: false,
+                selection_active: self.selection.is_active(),
             },
         }
     }
 
     /// Update selection during mouse drag.
     ///
+    /// Only extends the selection while the left button is held, so simply
+    /// moving the mouse never selects text.
+    ///
     /// # Arguments
     ///
     /// * `position` - Mouse position in pixels.
     /// * `cell_width` - Width of a single cell in pixels.
     /// * `cell_height` - Height of a single cell in pixels.
-    pub fn update_selection(&mut self, position: (f64, f64), cell_width: f64, cell_height: f64) {
-        if self.selection.start.is_some() {
-            let (row, col) = Self::pixel_to_cell(position.0, position.1, cell_width, cell_height);
-            self.selection.current = Some((row, col));
+    /// * `rows` - Number of rows in the grid (for clamping).
+    /// * `cols` - Number of columns in the grid (for clamping).
+    pub fn update_selection(
+        &mut self,
+        position: (f64, f64),
+        cell_width: f64,
+        cell_height: f64,
+        rows: usize,
+        cols: usize,
+    ) {
+        if !self.dragging {
+            return;
         }
+        let (row, col) = Self::pixel_to_cell_clamped(
+            position.0,
+            position.1,
+            cell_width,
+            cell_height,
+            rows,
+            cols,
+        );
+        self.selection.current = Some((row, col));
     }
 
     /// Add a custom key binding.
@@ -232,41 +296,34 @@ impl EventProcessor {
     /// `Some(TerminalInput)` for terminal input,
     /// or `None` if the event was not handled.
     pub fn process_key_event(&self, event: &KeyEvent) -> Option<EventResult> {
-        // Check keymap first for GUI actions
-        let gui_action = self.resolve_gui_action(event);
+        self.process_key(&event.logical_key, event.state)
+    }
+
+    /// Resolve a key press/release into a GUI action or terminal input.
+    ///
+    /// Only key *presses* produce results, so a shortcut fires once per press
+    /// instead of also on release.
+    ///
+    /// Split out from [`process_key_event`](Self::process_key_event) so it can
+    /// be exercised without constructing a winit `KeyEvent`.
+    pub fn process_key(&self, key: &Key, state: ElementState) -> Option<EventResult> {
+        if state != ElementState::Pressed {
+            return None;
+        }
+
+        // Check the keymap first for GUI actions.
+        let gui_action = self.keymap.resolve(key, &self.modifiers);
         if gui_action != GuiAction::None {
             return Some(EventResult::GuiAction(gui_action));
         }
 
-        // Convert to terminal input only for key press events
-        if event.state == ElementState::Pressed {
-            if let Some(input) = self.key_event_to_terminal_input(event) {
-                return Some(EventResult::TerminalInput(input));
-            }
-        }
-
-        None
-    }
-
-    /// Resolve a key event to a GUI action.
-    fn resolve_gui_action(&self, event: &KeyEvent) -> GuiAction {
-        let key = &event.logical_key;
-        self.keymap.resolve(key, &self.modifiers)
-    }
-
-    /// Convert a winit `KeyEvent` to terminal input.
-    fn key_event_to_terminal_input(&self, event: &KeyEvent) -> Option<TerminalInput> {
-        if event.state != ElementState::Pressed {
-            return None;
-        }
-
-        let terminal_event = Self::key_to_terminal_event(&event.logical_key, self.modifiers)?;
+        let terminal_event = Self::key_to_terminal_event(key, self.modifiers)?;
         let bytes = terminal_core::input::key_event_to_bytes(&terminal_event);
 
-        Some(TerminalInput {
+        Some(EventResult::TerminalInput(TerminalInput {
             bytes,
             event: terminal_event,
-        })
+        }))
     }
 
     /// Convert a winit Key to a terminal `KeyEvent`.
@@ -285,6 +342,11 @@ impl EventProcessor {
                 Some(char_event)
             }
             Key::Named(named) => match named {
+                NamedKey::Space => Some(TerminalKeyEvent::Char {
+                    c: ' ',
+                    ctrl: modifiers.control_key(),
+                    alt: modifiers.alt_key(),
+                }),
                 NamedKey::ArrowUp => Some(TerminalKeyEvent::Arrow {
                     direction: ArrowDirection::Up,
                     ctrl: modifiers.control_key(),
@@ -455,6 +517,17 @@ mod tests {
     }
 
     #[test]
+    fn test_key_to_terminal_space() {
+        // winit reports the space bar as `NamedKey::Space`, not as a character.
+        let modifiers = ModifiersState::default();
+        let result = EventProcessor::key_to_terminal_event(&Key::Named(NamedKey::Space), modifiers);
+        assert!(result.is_some());
+        let event = result.unwrap();
+        let bytes = terminal_core::input::key_event_to_bytes(&event);
+        assert_eq!(bytes, vec![b' ']);
+    }
+
+    #[test]
     fn test_key_to_terminal_ctrl_c() {
         let modifiers = ModifiersState::CONTROL;
         let result = EventProcessor::key_to_terminal_event(&Key::Character("c".into()), modifiers);
@@ -493,6 +566,63 @@ mod tests {
         let event = result.unwrap();
         let bytes = terminal_core::input::key_event_to_bytes(&event);
         assert_eq!(bytes, vec![b'n']);
+    }
+
+    #[test]
+    fn test_ctrl_d_after_modifiers_change() {
+        // Regression: the GUI must feed `WindowEvent::ModifiersChanged` into the
+        // processor, otherwise Ctrl combos are seen as plain characters.
+        let mut processor = EventProcessor::new();
+        processor.update_modifiers(ModifiersState::CONTROL);
+
+        let result = processor.process_key(&Key::Character("d".into()), ElementState::Pressed);
+        match result {
+            Some(EventResult::TerminalInput(input)) => assert_eq!(input.bytes, vec![0x04]),
+            other => panic!("expected Ctrl+D to send EOT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plain_d_without_modifiers() {
+        let processor = EventProcessor::new();
+        let result = processor.process_key(&Key::Character("d".into()), ElementState::Pressed);
+        match result {
+            Some(EventResult::TerminalInput(input)) => assert_eq!(input.bytes, vec![b'd']),
+            other => panic!("expected plain 'd', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shortcut_after_modifiers_change() {
+        let mut processor = EventProcessor::new();
+        processor.update_modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+        assert!(matches!(
+            processor.process_key(&Key::Character("n".into()), ElementState::Pressed),
+            Some(EventResult::GuiAction(GuiAction::NewTab))
+        ));
+    }
+
+    #[test]
+    fn test_release_does_not_trigger_action() {
+        // Regression: a shortcut must fire once per press, not also on release
+        // (which opened two tabs / closed two).
+        let mut processor = EventProcessor::new();
+        processor.update_modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+
+        assert!(processor
+            .process_key(&Key::Character("n".into()), ElementState::Released)
+            .is_none());
+        assert!(processor
+            .process_key(&Key::Character("w".into()), ElementState::Released)
+            .is_none());
+    }
+
+    #[test]
+    fn test_release_sends_no_terminal_input() {
+        let processor = EventProcessor::new();
+        assert!(processor
+            .process_key(&Key::Character("a".into()), ElementState::Released)
+            .is_none());
     }
 
     #[test]
@@ -605,8 +735,11 @@ mod tests {
             (15.0, 25.0),
             10.0,
             20.0,
+            24,
+            80,
         );
         assert!(event.selection_active);
+        assert!(processor.is_dragging());
         assert_eq!(processor.selection().bounds(), Some((1, 1, 1, 1)));
     }
 
@@ -620,32 +753,90 @@ mod tests {
             (10.0, 20.0),
             10.0,
             20.0,
+            24,
+            80,
         );
         // Drag to new position
-        processor.update_selection((50.0, 80.0), 10.0, 20.0);
+        processor.update_selection((50.0, 80.0), 10.0, 20.0, 24, 80);
         assert!(processor.selection().is_active());
         assert_eq!(processor.selection().bounds(), Some((1, 1, 4, 5)));
     }
 
     #[test]
-    fn test_mouse_event_release_selection() {
+    fn test_drag_selection_survives_release() {
         let mut processor = EventProcessor::new();
-        // Start selection
         processor.process_mouse_event(
             MouseButton::Left,
             ElementState::Pressed,
             (10.0, 20.0),
             10.0,
             20.0,
+            24,
+            80,
         );
-        // Release
+        processor.update_selection((50.0, 80.0), 10.0, 20.0, 24, 80);
+        let event = processor.process_mouse_event(
+            MouseButton::Left,
+            ElementState::Released,
+            (50.0, 80.0),
+            10.0,
+            20.0,
+            24,
+            80,
+        );
+        assert!(event.selection_active);
+        assert!(!processor.is_dragging());
+        assert_eq!(processor.selection().bounds(), Some((1, 1, 4, 5)));
+    }
+
+    #[test]
+    fn test_click_clears_selection() {
+        // A click without dragging must not leave a stuck highlight.
+        let mut processor = EventProcessor::new();
+        processor.process_mouse_event(
+            MouseButton::Left,
+            ElementState::Pressed,
+            (10.0, 20.0),
+            10.0,
+            20.0,
+            24,
+            80,
+        );
         let event = processor.process_mouse_event(
             MouseButton::Left,
             ElementState::Released,
             (10.0, 20.0),
             10.0,
             20.0,
+            24,
+            80,
         );
-        assert!(event.selection_active);
+        assert!(!event.selection_active);
+        assert!(!processor.selection().is_active());
+        assert!(!processor.is_dragging());
+    }
+
+    #[test]
+    fn test_motion_without_drag_does_not_select() {
+        let mut processor = EventProcessor::new();
+        processor.update_selection((100.0, 200.0), 10.0, 20.0, 24, 80);
+        assert!(!processor.selection().is_active());
+    }
+
+    #[test]
+    fn test_selection_is_clamped_to_grid() {
+        let mut processor = EventProcessor::new();
+        // Press at the origin of a 2x3 grid and drag far past its end.
+        processor.process_mouse_event(
+            MouseButton::Left,
+            ElementState::Pressed,
+            (0.0, 0.0),
+            10.0,
+            20.0,
+            2,
+            3,
+        );
+        processor.update_selection((9999.0, 9999.0), 10.0, 20.0, 2, 3);
+        assert_eq!(processor.selection().bounds(), Some((0, 0, 1, 2)));
     }
 }

@@ -13,6 +13,9 @@ pub struct TerminalEngine {
     parser: Parser,
     state: TerminalState,
     buffer: GridBuffer,
+    /// Set when a character is written in the last column: the cursor only
+    /// wraps on the next printable character (DECAWM deferred wrap).
+    wrap_pending: bool,
 }
 
 impl TerminalEngine {
@@ -22,6 +25,7 @@ impl TerminalEngine {
             parser: Parser::new(),
             state: TerminalState::default(),
             buffer: GridBuffer::new(rows, cols),
+            wrap_pending: false,
         }
     }
 
@@ -41,35 +45,52 @@ impl TerminalEngine {
     /// Apply a parsed action to the terminal state and buffer.
     #[expect(clippy::too_many_lines, reason = "Terminal engine action handling")]
     fn apply_action(&mut self, action: Action, gui_actions: &mut Vec<Action>) {
+        // `state.cursor` is the engine's source of truth, but buffer-level
+        // operations (`clear_line`, `insert_lines`, `delete_lines`, …) read the
+        // `ScreenBuffer`'s own cursor fields. Mirror the cursor first so those
+        // operations act on the current position instead of a stale one.
+        self.sync_cursor_to_buffer();
+
         match action {
             Action::Write(c) => self.write_char(c),
-            Action::CursorPosition(row, col) => self.state.cursor.move_to(row, col),
+            Action::CursorPosition(row, col) | Action::MoveCursorTo(row, col) => {
+                self.state.cursor.move_to(row, col);
+                self.wrap_pending = false;
+            }
             Action::CursorUp(n) => {
                 self.state.cursor.row = self.state.cursor.row.saturating_sub(n);
+                self.wrap_pending = false;
             }
             Action::CursorDown(n) => {
                 self.state.cursor.row = self.state.cursor.row.saturating_add(n);
+                self.wrap_pending = false;
             }
             Action::CursorForward(n) => {
                 self.state.cursor.col = self.state.cursor.col.saturating_add(n);
+                self.wrap_pending = false;
             }
             Action::CursorBackward(n) => {
                 self.state.cursor.col = self.state.cursor.col.saturating_sub(n);
+                self.wrap_pending = false;
             }
             Action::CursorToColumn(col) => {
                 let cols = self.buffer.active().grid.cols;
                 self.state.cursor.col = col.min(cols.saturating_sub(1));
+                self.wrap_pending = false;
             }
             Action::CursorHome => {
                 self.state.cursor.move_to(0, 0);
+                self.wrap_pending = false;
             }
-            Action::EraseInLine => {
+            Action::EraseInLine(mode) => {
+                let (row, col) = (self.state.cursor.row, self.state.cursor.col);
                 let buf = self.buffer.active_mut();
-                buf.clear_line();
+                buf.erase_in_line(row, col, mode);
             }
-            Action::EraseInDisplay => {
+            Action::EraseInDisplay(mode) => {
+                let (row, col) = (self.state.cursor.row, self.state.cursor.col);
                 let buf = self.buffer.active_mut();
-                buf.clear_screen();
+                buf.erase_in_display(row, col, mode);
             }
             Action::InsertLines(n) => {
                 let buf = self.buffer.active_mut();
@@ -81,25 +102,23 @@ impl TerminalEngine {
             }
             Action::LineFeed => {
                 if self.buffer.is_alternate_screen_active() {
-                    let buf = self.buffer.active_mut();
-                    buf.cursor_row += 1;
-                    if buf.cursor_row >= buf.grid.rows {
-                        buf.scroll_up(1);
-                        buf.cursor_row = buf.grid.rows - 1;
-                    }
+                    self.buffer.alternate_line_feed();
                 } else {
                     self.buffer.main_line_feed();
                 }
-                // Sync state cursor with buffer
-                let buf = self.buffer.active();
-                self.state.cursor.row = buf.cursor().0;
-                self.state.cursor.col = buf.cursor().1;
+                // A line feed moves down one row (scrolling at the bottom) and
+                // resets the column, which is the meaning `\n` has here.
+                self.state.cursor.row = self.buffer.active().cursor().0;
+                self.state.cursor.col = 0;
+                self.wrap_pending = false;
             }
             Action::CarriageReturn => {
                 self.state.cursor.col = 0;
+                self.wrap_pending = false;
             }
             Action::Backspace => {
                 self.state.cursor.col = self.state.cursor.col.saturating_sub(1);
+                self.wrap_pending = false;
             }
             Action::SetAttributes(attrs) => {
                 self.state.attributes = attrs;
@@ -167,9 +186,6 @@ impl TerminalEngine {
             Action::SetWindowIconAndTitle(title) => {
                 gui_actions.push(Action::SetWindowIconAndTitle(title));
             }
-            Action::MoveCursorTo(row, col) => {
-                self.state.cursor.move_to(row, col);
-            }
             Action::HyperlinkStart(url) => {
                 gui_actions.push(Action::HyperlinkStart(url));
             }
@@ -180,8 +196,41 @@ impl TerminalEngine {
         }
     }
 
+    /// Mirror [`TerminalState::cursor`] into the active screen buffer.
+    ///
+    /// [`TerminalState::cursor`] is the single source of truth for the engine,
+    /// while buffer operations such as `clear_line` or `insert_lines` use the
+    /// `ScreenBuffer`'s cursor fields. Keeping both in sync avoids acting on a
+    /// stale position (for example `ESC [ K` erasing from column 0).
+    fn sync_cursor_to_buffer(&mut self) {
+        let (row, col) = (self.state.cursor.row, self.state.cursor.col);
+        let buf = self.buffer.active_mut();
+        buf.cursor_row = row;
+        buf.cursor_col = col;
+    }
+
     /// Write a character at the current cursor position.
     fn write_char(&mut self, c: char) {
+        let cols = self.buffer.active().grid.cols;
+        let rows = self.buffer.active().grid.rows;
+
+        // Deferred wrap (DECAWM): writing the last column does not move to the
+        // next row by itself; the wrap happens when the next character is
+        // written. Without this, a line exactly `cols` wide consumes two rows.
+        if self.wrap_pending {
+            self.wrap_pending = false;
+            self.state.cursor.col = 0;
+            self.state.cursor.row += 1;
+            if self.state.cursor.row >= rows {
+                if self.buffer.is_alternate_screen_active() {
+                    self.buffer.alternate_line_feed();
+                } else {
+                    self.buffer.main_line_feed();
+                }
+                self.state.cursor.row = self.buffer.active().cursor().0;
+            }
+        }
+
         let row = self.state.cursor.row;
         let col = self.state.cursor.col;
         let style = CellStyle {
@@ -198,22 +247,11 @@ impl TerminalEngine {
         let buf = self.buffer.active_mut();
         buf.grid.set(row, col, Cell { c, style });
 
-        // Advance cursor
-        self.state.cursor.col += 1;
-        if self.state.cursor.col >= buf.grid.cols {
-            self.state.cursor.col = 0;
-            self.state.cursor.row += 1;
-            if self.state.cursor.row >= buf.grid.rows {
-                if self.buffer.is_alternate_screen_active() {
-                    self.buffer.alternate_line_feed();
-                } else {
-                    self.buffer.main_line_feed();
-                }
-                // Sync state cursor after scroll (buffer cursor is now at last row)
-                let buf = self.buffer.active();
-                self.state.cursor.row = buf.cursor().0;
-                self.state.cursor.col = buf.cursor().1;
-            }
+        // Advance the column, or arm the deferred wrap at the last column.
+        if self.state.cursor.col + 1 >= cols {
+            self.wrap_pending = true;
+        } else {
+            self.state.cursor.col += 1;
         }
     }
 
@@ -333,6 +371,23 @@ impl TerminalEngine {
         let buf = self.buffer.active();
         (buf.grid.rows, buf.grid.cols)
     }
+
+    /// Resize the screen to the given dimensions.
+    ///
+    /// Content is preserved where it fits; the cursor is clamped to the new
+    /// bounds.
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        if self.dimensions() == (rows, cols) {
+            return;
+        }
+        self.buffer.resize(rows, cols);
+        self.state.cursor.row = self.state.cursor.row.min(rows - 1);
+        self.state.cursor.col = self.state.cursor.col.min(cols - 1);
+        self.sync_cursor_to_buffer();
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +434,104 @@ mod tests {
     }
 
     #[test]
+    fn test_erase_in_line_modes() {
+        // 2K erases the whole line, wherever the cursor is.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"abcdef\x1b[4G\x1b[2K");
+        for col in 0..6 {
+            assert_eq!(engine.buffer().active().grid.get(0, col).c, ' ');
+        }
+
+        // 1K erases from the start up to (and including) the cursor.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"abcdef\x1b[4G\x1b[1K");
+        let buf = engine.buffer().active();
+        for col in 0..4 {
+            assert_eq!(buf.grid.get(0, col).c, ' ');
+        }
+        assert_eq!(buf.grid.get(0, 4).c, 'e');
+
+        // 0K erases from the cursor to the end.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"abcdef\x1b[4G\x1b[0K");
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 2).c, 'c');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(buf.grid.get(0, 5).c, ' ');
+    }
+
+    #[test]
+    fn test_erase_in_display_modes() {
+        // 0J erases from the cursor down, keeping earlier lines intact.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"one\r\ntwo\r\nthree\x1b[2;1H\x1b[0J");
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, 'o');
+        assert_eq!(buf.grid.get(1, 0).c, ' ');
+        assert_eq!(buf.grid.get(2, 0).c, ' ');
+
+        // 2J erases the whole screen.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"one\r\ntwo\x1b[2J");
+        assert_eq!(engine.buffer().active().grid.get(0, 0).c, ' ');
+        assert_eq!(engine.buffer().active().grid.get(1, 0).c, ' ');
+    }
+
+    #[test]
+    fn test_readline_echo_does_not_overwrite() {
+        // Regression: interactive shells (readline) echo each keystroke as
+        // `<char> CR <prompt> ESC[C*n`, moving right with a bare `ESC [ C`.
+        // The cursor must advance so previously typed characters survive.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"> ");
+        engine.input(b"h\r> \x1b[C");
+        engine.input(b"e\r> \x1b[C\x1b[C");
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, '>');
+        assert_eq!(buf.grid.get(0, 1).c, ' ');
+        assert_eq!(buf.grid.get(0, 2).c, 'h');
+        assert_eq!(buf.grid.get(0, 3).c, 'e');
+        assert_eq!(engine.state().cursor.col, 4);
+    }
+
+    #[test]
+    fn test_erase_in_line_starts_at_cursor() {
+        // Regression: `ESC [ K` (EL) must erase from the cursor to the end of
+        // the line, not from column 0. The engine cursor lives in
+        // `state.cursor`, so the buffer cursor has to be kept in sync.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"abcdef");
+        engine.input(b"\x1b[3D"); // cursor back to column 3
+        engine.input(b"\x1b[K"); // erase 3..end
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, 'a');
+        assert_eq!(buf.grid.get(0, 1).c, 'b');
+        assert_eq!(buf.grid.get(0, 2).c, 'c');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(buf.grid.get(0, 5).c, ' ');
+    }
+
+    #[test]
+    fn test_readline_backspace_erases_only_last_char() {
+        // Readline deletes a character with `BS ESC [ K CR <prompt> ESC [ C*n`.
+        // Only the character under the cursor may be erased.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"> ");
+        engine.input(b"a\r> \x1b[C");
+        engine.input(b"b\r> \x1b[C\x1b[C");
+        engine.input(b"\x08\x1b[K\r> \x1b[C");
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, '>');
+        assert_eq!(buf.grid.get(0, 1).c, ' ');
+        assert_eq!(buf.grid.get(0, 2).c, 'a');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(engine.state().cursor.col, 3);
+    }
+
+    #[test]
     fn test_cha_keeps_row() {
         let mut engine = TerminalEngine::new(24, 80);
         // Move to row 5, then CHA to column 11 (0-indexed 10).
@@ -406,15 +559,54 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_does_not_overlap_output_after_scroll() {
+        // Regression: when output fills the screen, the lines must scroll up so
+        // the prompt lands on a fresh line instead of overwriting the last one.
+        let mut engine = TerminalEngine::new(3, 10);
+        engine.input(b"a\r\nb\r\nc\r\n");
+        engine.input(b"$ ");
+
+        let buf = engine.buffer().active();
+        let row = |r: usize| -> String {
+            (0..buf.grid.cols)
+                .map(|c| buf.grid.get(r, c).c)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(1), "c");
+        assert_eq!(row(2), "$");
+    }
+
+    #[test]
     fn test_wrap_around() {
         let mut engine = TerminalEngine::new(1, 5);
         engine.input(b"ABCDE");
-        // After writing 5 chars in a 5-col grid, cursor wraps to col 0
-        assert_eq!(engine.state().cursor.col, 0);
-        assert_eq!(engine.state().cursor.row, 0); // scrolled to first row
+        // Deferred wrap: the cursor stays in the last column until the next
+        // character is actually written.
+        assert_eq!(engine.state().cursor.col, 4);
+        assert_eq!(engine.state().cursor.row, 0);
+
         engine.input(b"F");
+        // 'F' wraps to a new line, scrolling the single-row screen.
         let buf = engine.buffer().active();
         assert_eq!(buf.grid.rows, 1);
+        assert_eq!(buf.grid.get(0, 0).c, 'F');
+    }
+
+    #[test]
+    fn test_full_width_line_occupies_one_row() {
+        // Regression: `top` pads every line to the full width. With immediate
+        // wrapping that consumed two rows per line, scrolling the header away.
+        let mut engine = TerminalEngine::new(4, 5);
+        engine.input(b"AAAAA\r\nBBBBB\r\n");
+
+        let buf = engine.buffer().active();
+        let row =
+            |r: usize| -> String { (0..buf.grid.cols).map(|c| buf.grid.get(r, c).c).collect() };
+        assert_eq!(row(0), "AAAAA");
+        assert_eq!(row(1), "BBBBB");
+        assert_eq!(row(2), "     ");
     }
 
     #[test]
@@ -590,5 +782,22 @@ mod tests {
     fn test_dimensions() {
         let engine = TerminalEngine::new(24, 80);
         assert_eq!(engine.dimensions(), (24, 80));
+    }
+
+    #[test]
+    fn test_resize_reflows_grid() {
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"hello");
+
+        engine.resize(5, 10);
+        assert_eq!(engine.dimensions(), (5, 10));
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, 'h');
+        assert_eq!(buf.grid.get(0, 4).c, 'o');
+
+        // Writing continues at the preserved cursor position.
+        engine.input(b"!");
+        assert_eq!(engine.buffer().active().grid.get(0, 5).c, '!');
     }
 }

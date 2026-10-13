@@ -45,26 +45,53 @@ impl ScreenBuffer {
         self.cursor_col = col;
     }
 
-    /// Scroll up by n lines (push active to scrollback).
+    /// Resize the buffer, preserving the content that still fits.
+    ///
+    /// Content is anchored at the top-left; the cursor is clamped to the new
+    /// bounds.
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        if rows == self.grid.rows && cols == self.grid.cols {
+            return;
+        }
+        let old_rows = self.grid.rows;
+        let old_cols = self.grid.cols;
+
+        let mut cells = vec![Cell::default(); rows * cols];
+        let copy_rows = rows.min(old_rows);
+        let copy_cols = cols.min(old_cols);
+        for row in 0..copy_rows {
+            for col in 0..copy_cols {
+                cells[row * cols + col] = self.grid.cells[row * old_cols + col];
+            }
+        }
+
+        self.grid.rows = rows;
+        self.grid.cols = cols;
+        self.grid.cells = cells;
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+    }
+
+    /// Scroll the active grid up by `n` lines.
+    ///
+    /// Lines are shifted towards the top and the `n` rows revealed at the
+    /// bottom are blanked. This is the primitive behind line feed at the
+    /// bottom of the screen.
     pub fn scroll_up(&mut self, n: usize) {
         if n == 0 {
             return;
         }
-        // Move the visible portion to scrollback
-        let visible: Vec<Cell> = self.grid.cells.clone();
-        // Shift grid content down by n lines
         let rows = self.grid.rows;
         let cols = self.grid.cols;
         let shift = n.min(rows);
 
-        let mut new_cells = vec![Cell::default(); rows * cols];
-        // Copy lines that remain visible (after scrolling)
-        for row in shift..rows {
-            for col in 0..cols {
-                new_cells[row * cols + col] = visible[row * cols + col];
-            }
+        // Shift the surviving lines up by `shift` rows.
+        if shift < rows {
+            self.grid.cells.copy_within(shift * cols..rows * cols, 0);
         }
-        self.grid.cells = new_cells;
+        // Blank the rows revealed at the bottom.
+        self.grid.cells[(rows - shift) * cols..].fill(Cell::default());
+
         self.cursor_row = self.cursor_row.saturating_sub(shift);
     }
 
@@ -167,6 +194,45 @@ impl ScreenBuffer {
             self.grid.cells[self.cursor_row * cols + col] = Cell::default();
         }
     }
+
+    /// Erase part of a line (EL).
+    ///
+    /// `mode`: `0` = cursor→end, `1` = start→cursor (inclusive), `2` = whole line.
+    pub fn erase_in_line(&mut self, row: usize, col: usize, mode: u8) {
+        if row >= self.grid.rows {
+            return;
+        }
+        let cols = self.grid.cols;
+        let (start, end) = match mode {
+            1 => (0, (col + 1).min(cols)),
+            2 => (0, cols),
+            _ => (col.min(cols), cols),
+        };
+        for c in start..end {
+            self.grid.cells[row * cols + c] = Cell::default();
+        }
+    }
+
+    /// Erase part of the display (ED).
+    ///
+    /// `mode`: `0` = cursor→end, `1` = start→cursor (inclusive), `2` = whole screen.
+    pub fn erase_in_display(&mut self, row: usize, col: usize, mode: u8) {
+        match mode {
+            1 => {
+                for r in 0..row.min(self.grid.rows) {
+                    self.erase_in_line(r, 0, 2);
+                }
+                self.erase_in_line(row, col, 1);
+            }
+            2 => self.grid.clear(),
+            _ => {
+                self.erase_in_line(row, col, 0);
+                for r in (row + 1)..self.grid.rows {
+                    self.erase_in_line(r, 0, 2);
+                }
+            }
+        }
+    }
 }
 
 /// The complete buffer manager: active screen + scrollback + alternate screen.
@@ -253,6 +319,17 @@ impl GridBuffer {
         self.alternate = None;
     }
 
+    /// Resize both the main and alternate screen buffers.
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        self.main.resize(rows, cols);
+        if let Some(alt) = self.alternate.as_mut() {
+            alt.resize(rows, cols);
+        }
+    }
+
     /// Save current main screen to scrollback.
     fn save_to_scrollback(&mut self) {
         let entry = ScrollbackEntry {
@@ -328,25 +405,85 @@ mod tests {
     }
 
     #[test]
+    fn test_resize_preserves_content() {
+        let mut buf = ScreenBuffer::new(3, 4);
+        buf.grid.cells[0] = Cell {
+            c: 'A',
+            ..Cell::default()
+        };
+        buf.grid.cells[5] = Cell {
+            c: 'B',
+            ..Cell::default()
+        };
+        buf.set_cursor(2, 3);
+
+        buf.resize(2, 2);
+
+        assert_eq!((buf.grid.rows, buf.grid.cols), (2, 2));
+        assert_eq!(buf.grid.get(0, 0).c, 'A');
+        assert_eq!(buf.grid.get(1, 1).c, 'B');
+        // The cursor is clamped into the new bounds.
+        assert_eq!(buf.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn test_resize_grow_pads_with_blanks() {
+        let mut buf = ScreenBuffer::new(2, 2);
+        buf.grid.cells[0] = Cell {
+            c: 'X',
+            ..Cell::default()
+        };
+
+        buf.resize(4, 5);
+
+        assert_eq!((buf.grid.rows, buf.grid.cols), (4, 5));
+        assert_eq!(buf.grid.get(0, 0).c, 'X');
+        assert_eq!(buf.grid.get(3, 4).c, ' ');
+    }
+
+    #[test]
     fn test_scroll_up() {
-        let mut buf = ScreenBuffer::new(5, 5);
-        // Fill with 'A'
-        for row in 0..5 {
+        let mut buf = ScreenBuffer::new(3, 5);
+        // Row 0 = 'A', row 1 = 'B', row 2 = 'C'.
+        for (row, ch) in [(0usize, 'A'), (1, 'B'), (2, 'C')] {
             for col in 0..5 {
                 buf.grid.cells[row * 5 + col] = Cell {
-                    c: 'A',
+                    c: ch,
                     ..Cell::default()
                 };
             }
         }
+
         buf.scroll_up(1);
-        // First row should now be empty
+
+        // Content shifts up one row and the bottom row is blanked.
         for col in 0..5 {
-            assert_eq!(buf.grid.cells[col].c, ' ');
+            assert_eq!(buf.grid.cells[col].c, 'B');
+            assert_eq!(buf.grid.cells[5 + col].c, 'C');
+            assert_eq!(buf.grid.cells[10 + col].c, ' ');
         }
-        // Second row should have 'A'
-        for col in 0..5 {
-            assert_eq!(buf.grid.cells[5 + col].c, 'A');
+    }
+
+    #[test]
+    fn test_scroll_up_multiple_lines() {
+        let mut buf = ScreenBuffer::new(4, 3);
+        for (row, ch) in [(0usize, 'A'), (1, 'B'), (2, 'C'), (3, 'D')] {
+            for col in 0..3 {
+                buf.grid.cells[row * 3 + col] = Cell {
+                    c: ch,
+                    ..Cell::default()
+                };
+            }
+        }
+
+        buf.scroll_up(2);
+
+        // 'C' and 'D' survive, shifted to the top; the last two rows are blank.
+        for col in 0..3 {
+            assert_eq!(buf.grid.cells[col].c, 'C');
+            assert_eq!(buf.grid.cells[3 + col].c, 'D');
+            assert_eq!(buf.grid.cells[6 + col].c, ' ');
+            assert_eq!(buf.grid.cells[9 + col].c, ' ');
         }
     }
 

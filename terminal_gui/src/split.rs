@@ -15,6 +15,19 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// A pixel rectangle within the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rect {
+    /// Left edge in pixels.
+    pub x: u32,
+    /// Top edge in pixels.
+    pub y: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
 /// Direction of a split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
@@ -130,11 +143,13 @@ impl SplitNode {
     pub fn split_h(&mut self, new_panel: Panel, ratio: f32) {
         match self {
             SplitNode::Leaf(_) => {
-                // Leaf node: split it directly
+                // Leaf node: split it directly. The old panel loses focus and
+                // the new one takes it, so exactly one panel stays focused.
                 let old_node = std::mem::replace(self, SplitNode::Leaf(Panel::default()));
-                let SplitNode::Leaf(old_panel) = old_node else {
+                let SplitNode::Leaf(mut old_panel) = old_node else {
                     unreachable!()
                 };
+                old_panel.unfocus();
                 let mut new_right = SplitNode::new_leaf(new_panel);
                 new_right.focus_first();
                 *self = SplitNode::new_split(
@@ -162,11 +177,13 @@ impl SplitNode {
     pub fn split_v(&mut self, new_panel: Panel, ratio: f32) {
         match self {
             SplitNode::Leaf(_) => {
-                // Leaf node: split it directly
+                // Leaf node: split it directly. The old panel loses focus and
+                // the new one takes it, so exactly one panel stays focused.
                 let old_node = std::mem::replace(self, SplitNode::Leaf(Panel::default()));
-                let SplitNode::Leaf(old_panel) = old_node else {
+                let SplitNode::Leaf(mut old_panel) = old_node else {
                     unreachable!()
                 };
+                old_panel.unfocus();
                 let mut new_right = SplitNode::new_leaf(new_panel);
                 new_right.focus_first();
                 *self = SplitNode::new_split(
@@ -189,44 +206,15 @@ impl SplitNode {
 
     /// Navigate to the panel in the given direction.
     ///
-    /// Returns `Some(PanelId)` of the focused panel after navigation.
+    /// Returns `Some(PanelId)` of the newly focused panel.
     pub fn navigate(&mut self, direction: NavigateDirection) -> Option<PanelId> {
-        match self {
-            SplitNode::Leaf(panel) => {
-                panel.focus();
-                Some(panel.id)
-            }
-            SplitNode::Split {
-                direction: split_dir,
-                left,
-                right,
-                ..
-            } => {
-                match (split_dir, direction) {
-                    // Horizontal split: up/down navigation
-                    // Vertical split: left/right navigation
-                    (SplitDirection::Horizontal, NavigateDirection::Up)
-                    | (SplitDirection::Vertical, NavigateDirection::Left) => {
-                        right.navigate_internal(direction)
-                    }
-                    (SplitDirection::Horizontal, NavigateDirection::Down)
-                    | (SplitDirection::Vertical, NavigateDirection::Right) => {
-                        left.navigate_internal(direction)
-                    }
-                    // Same direction: recurse into focused child
-                    _ => {
-                        if left.is_focused() {
-                            left.navigate_internal(direction)
-                        } else {
-                            right.navigate_internal(direction)
-                        }
-                    }
-                }
-            }
-        }
+        self.navigate_internal(direction)
     }
 
-    /// Internal navigation without focusing the current node.
+    /// Recursively move focus one panel in the given direction.
+    ///
+    /// `left` is the top/left child and `right` the bottom/right child, so the
+    /// mapping from a direction to a child depends on the split axis.
     fn navigate_internal(&mut self, direction: NavigateDirection) -> Option<PanelId> {
         match self {
             SplitNode::Leaf(panel) => {
@@ -238,27 +226,26 @@ impl SplitNode {
                 left,
                 right,
                 ..
-            } => {
-                match (split_dir, direction) {
-                    // Horizontal split: up/down navigation
-                    // Vertical split: left/right navigation
-                    (SplitDirection::Horizontal, NavigateDirection::Up)
-                    | (SplitDirection::Vertical, NavigateDirection::Left) => {
+            } => match (split_dir, direction) {
+                // Stacked panels: Up reaches the top child, Down the bottom.
+                // Side-by-side panels: Left reaches the left child, Right the right.
+                (SplitDirection::Horizontal, NavigateDirection::Up)
+                | (SplitDirection::Vertical, NavigateDirection::Left) => {
+                    left.navigate_internal(direction)
+                }
+                (SplitDirection::Horizontal, NavigateDirection::Down)
+                | (SplitDirection::Vertical, NavigateDirection::Right) => {
+                    right.navigate_internal(direction)
+                }
+                // Perpendicular direction: move inside the focused subtree.
+                _ => {
+                    if left.is_focused() {
+                        left.navigate_internal(direction)
+                    } else {
                         right.navigate_internal(direction)
                     }
-                    (SplitDirection::Horizontal, NavigateDirection::Down)
-                    | (SplitDirection::Vertical, NavigateDirection::Right) => {
-                        left.navigate_internal(direction)
-                    }
-                    _ => {
-                        if left.is_focused() {
-                            left.navigate_internal(direction)
-                        } else {
-                            right.navigate_internal(direction)
-                        }
-                    }
                 }
-            }
+            },
         }
     }
 
@@ -303,8 +290,37 @@ impl SplitNode {
         }
     }
 
+    /// ID of the focused leaf, or the first leaf when none is focused.
+    fn focused_panel_id(&self) -> PanelId {
+        match self {
+            SplitNode::Leaf(panel) => panel.id,
+            SplitNode::Split { left, right, .. } => {
+                if left.is_focused() {
+                    left.focused_panel_id()
+                } else {
+                    right.focused_panel_id()
+                }
+            }
+        }
+    }
+
+    /// Focus the leaf with the given ID, clearing the others.
+    ///
+    /// Returns whether the ID was found.
+    fn focus_panel(&mut self, id: PanelId) -> bool {
+        match self {
+            SplitNode::Leaf(panel) => {
+                panel.is_focused = panel.id == id;
+                panel.id == id
+            }
+            SplitNode::Split { left, right, .. } => {
+                // Evaluate both sides so every other panel is unfocused.
+                left.focus_panel(id) | right.focus_panel(id)
+            }
+        }
+    }
+
     /// Iterate over all panel IDs in this subtree.
-    #[allow(dead_code)]
     fn panel_ids(&self) -> PanelIdIterator<'_> {
         PanelIdIterator::new(self)
     }
@@ -350,11 +366,98 @@ impl Default for SplitLayout {
 }
 
 impl SplitLayout {
-    /// Create a new split layout with a single panel.
+    /// Create a new split layout with a single focused panel.
     pub fn new() -> Self {
-        let panel = Panel::new(PanelId::new_id());
+        let mut panel = Panel::new(PanelId::new_id());
+        panel.focus();
         Self {
             root: SplitNode::new_leaf(panel),
+        }
+    }
+
+    /// ID of the focused panel.
+    pub fn focused_panel(&self) -> PanelId {
+        self.root.focused_panel_id()
+    }
+
+    /// All panel IDs, in layout order.
+    pub fn panels(&self) -> Vec<PanelId> {
+        self.root.panel_ids().collect()
+    }
+
+    /// Focus the panel with the given ID.
+    ///
+    /// Returns `true` if the panel exists.
+    pub fn focus_panel(&mut self, id: PanelId) -> bool {
+        if !self.panels().contains(&id) {
+            return false;
+        }
+        self.root.focus_panel(id);
+        true
+    }
+
+    /// Compute the pixel rectangle of every panel within `area`.
+    ///
+    /// `gap` is the pixel gap left between adjacent panels.
+    pub fn rects(&self, area: Rect, gap: u32) -> Vec<(PanelId, Rect)> {
+        let mut out = Vec::new();
+        Self::collect_rects(&self.root, area, gap, &mut out);
+        out
+    }
+
+    /// Recursively assign a rectangle to each leaf.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "Layout math on small pixel/ratio values"
+    )]
+    fn collect_rects(node: &SplitNode, area: Rect, gap: u32, out: &mut Vec<(PanelId, Rect)>) {
+        match node {
+            SplitNode::Leaf(panel) => out.push((panel.id, area)),
+            SplitNode::Split {
+                direction,
+                left,
+                right,
+                ratio,
+            } => {
+                let ratio = ratio.clamp(0.1, 0.9);
+                match direction {
+                    SplitDirection::Horizontal => {
+                        // Panels stacked vertically.
+                        let first = ((area.height as f32 * ratio) as u32).max(1);
+                        let gap = gap.min(area.height.saturating_sub(first));
+                        let rest = area.height.saturating_sub(first + gap);
+                        let top = Rect {
+                            height: first,
+                            ..area
+                        };
+                        let bottom = Rect {
+                            y: area.y + first + gap,
+                            height: rest,
+                            ..area
+                        };
+                        Self::collect_rects(left, top, gap, out);
+                        Self::collect_rects(right, bottom, gap, out);
+                    }
+                    SplitDirection::Vertical => {
+                        // Panels side by side.
+                        let first = ((area.width as f32 * ratio) as u32).max(1);
+                        let gap = gap.min(area.width.saturating_sub(first));
+                        let rest = area.width.saturating_sub(first + gap);
+                        let left_area = Rect {
+                            width: first,
+                            ..area
+                        };
+                        let right_area = Rect {
+                            x: area.x + first + gap,
+                            width: rest,
+                            ..area
+                        };
+                        Self::collect_rects(left, left_area, gap, out);
+                        Self::collect_rects(right, right_area, gap, out);
+                    }
+                }
+            }
         }
     }
 
@@ -378,17 +481,34 @@ impl SplitLayout {
         new_id
     }
 
-    /// Close the focused panel.
+    /// Close the focused panel, focusing another one.
     ///
-    /// Returns `Some(PanelId)` of the newly focused panel,
-    /// `None` if the layout is now empty (should close app).
+    /// Returns `Some(focused)` if panels remain, `None` if this was the last
+    /// panel (the caller should close the tab or app).
     pub fn close_panel(&mut self) -> Option<PanelId> {
         if self.root.panel_count() <= 1 {
             return None;
         }
 
-        // Find the focused leaf, unfocus it, and replace its parent
-        Self::close_in_tree(&mut self.root)
+        let target = self.root.focused_panel_id();
+        let root = std::mem::replace(&mut self.root, SplitNode::new_leaf(Panel::default()));
+        self.root = Self::remove_leaf(root, target);
+        self.root.focus_first();
+        Some(self.root.focused_panel_id())
+    }
+
+    /// Remove the panel with the given ID.
+    ///
+    /// Returns `false` when it is the only panel (nothing is removed).
+    pub fn remove_panel(&mut self, id: PanelId) -> bool {
+        if self.root.panel_count() <= 1 || !self.panels().contains(&id) {
+            return false;
+        }
+
+        let root = std::mem::replace(&mut self.root, SplitNode::new_leaf(Panel::default()));
+        self.root = Self::remove_leaf(root, id);
+        self.root.focus_first();
+        true
     }
 
     /// Navigate to a panel in the given direction.
@@ -397,7 +517,10 @@ impl SplitLayout {
     ///
     /// Panics if no panel is found in the layout.
     pub fn navigate(&mut self, direction: NavigateDirection) -> PanelId {
-        self.root.navigate(direction).expect("No panel found")
+        let id = self.root.navigate(direction).expect("No panel found");
+        // Keep exactly one panel focused.
+        self.root.focus_panel(id);
+        id
     }
 
     /// Get the number of panels.
@@ -410,22 +533,28 @@ impl SplitLayout {
         self.panel_count() == 1
     }
 
-    /// Recursively find and close the focused leaf in the tree.
-    fn close_in_tree(node: &mut SplitNode) -> Option<PanelId> {
+    /// Recursively rebuild `node` without the leaf `target`.
+    fn remove_leaf(node: SplitNode, target: PanelId) -> SplitNode {
         match node {
-            SplitNode::Leaf(panel) => {
-                if panel.is_focused {
-                    panel.unfocus();
-                    None
-                } else {
-                    None
+            SplitNode::Leaf(panel) => SplitNode::Leaf(panel),
+            SplitNode::Split {
+                direction,
+                left,
+                right,
+                ratio,
+            } => {
+                // Collapse the parent when a direct child is the target.
+                if matches!(left.as_ref(), SplitNode::Leaf(p) if p.id == target) {
+                    return *right;
                 }
-            }
-            SplitNode::Split { left, right, .. } => {
-                if left.is_focused() {
-                    Self::close_in_tree(left)
-                } else {
-                    Self::close_in_tree(right)
+                if matches!(right.as_ref(), SplitNode::Leaf(p) if p.id == target) {
+                    return *left;
+                }
+                SplitNode::Split {
+                    direction,
+                    left: Box::new(Self::remove_leaf(*left, target)),
+                    right: Box::new(Self::remove_leaf(*right, target)),
+                    ratio,
                 }
             }
         }
@@ -711,6 +840,207 @@ mod tests {
         let result = layout.close_panel();
         assert!(result.is_none());
         assert_eq!(layout.panel_count(), 1);
+    }
+
+    #[test]
+    fn test_split_focus_moves_to_new_panel() {
+        let mut layout = SplitLayout::new();
+        let first = layout.focused_panel();
+        let second = layout.split_vertical(0.5);
+
+        // The new panel takes focus.
+        assert_eq!(layout.focused_panel(), second);
+        // Focus can move back.
+        assert!(layout.focus_panel(first));
+        assert_eq!(layout.focused_panel(), first);
+        // Unknown panels are rejected.
+        assert!(!layout.focus_panel(PanelId(9999)));
+    }
+
+    #[test]
+    fn test_navigate_left_right_between_side_by_side_panes() {
+        let mut layout = SplitLayout::new();
+        let left = layout.focused_panel();
+        let right = layout.split_vertical(0.5); // left | right
+        assert_eq!(layout.focused_panel(), right);
+
+        // Left reaches the left pane.
+        assert_eq!(layout.navigate(NavigateDirection::Left), left);
+        assert_eq!(layout.focused_panel(), left);
+        // Right goes back.
+        assert_eq!(layout.navigate(NavigateDirection::Right), right);
+        assert_eq!(layout.focused_panel(), right);
+    }
+
+    #[test]
+    fn test_navigate_up_down_between_stacked_panes() {
+        let mut layout = SplitLayout::new();
+        let top = layout.focused_panel();
+        let bottom = layout.split_horizontal(0.5); // top / bottom
+        assert_eq!(layout.focused_panel(), bottom);
+
+        // Up reaches the top pane.
+        assert_eq!(layout.navigate(NavigateDirection::Up), top);
+        assert_eq!(layout.focused_panel(), top);
+        // Down goes back.
+        assert_eq!(layout.navigate(NavigateDirection::Down), bottom);
+        assert_eq!(layout.focused_panel(), bottom);
+    }
+
+    #[test]
+    fn test_close_panel_recovers_space() {
+        let mut layout = SplitLayout::new();
+        layout.split_vertical(0.5);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        assert_eq!(layout.rects(area, 0).len(), 2);
+
+        layout.close_panel();
+
+        let rects = layout.rects(area, 0);
+        assert_eq!(rects.len(), 1);
+        // The surviving panel takes the whole area back.
+        assert_eq!(rects[0].1, area);
+    }
+
+    #[test]
+    fn test_close_panel_recovers_space_when_nested() {
+        let mut layout = SplitLayout::new();
+        layout.split_horizontal(0.5); // top / bottom
+        layout.split_vertical(0.5); // bottom splits left | right
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        assert_eq!(layout.rects(area, 0).len(), 3);
+
+        layout.close_panel(); // closes the focused (right of the bottom split)
+
+        let rects = layout.rects(area, 0);
+        assert_eq!(rects.len(), 2);
+        // The bottom-left panel now fills the whole bottom half.
+        assert_eq!(rects[1].1.width, 100);
+        assert_eq!(rects[1].1.height, 20);
+    }
+
+    #[test]
+    fn test_remove_panel_recovers_space() {
+        let mut layout = SplitLayout::new();
+        let first = layout.focused_panel();
+        let second = layout.split_vertical(0.5);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        assert!(layout.remove_panel(second));
+
+        let rects = layout.rects(area, 0);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, first);
+        // The survivor takes the whole area back.
+        assert_eq!(rects[0].1, area);
+    }
+
+    #[test]
+    fn test_rects_vertical_split_side_by_side() {
+        let mut layout = SplitLayout::new();
+        layout.split_vertical(0.5);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let rects = layout.rects(area, 0);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            rects[0].1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 40
+            }
+        );
+        assert_eq!(
+            rects[1].1,
+            Rect {
+                x: 50,
+                y: 0,
+                width: 50,
+                height: 40
+            }
+        );
+    }
+
+    #[test]
+    fn test_rects_horizontal_split_stacked() {
+        let mut layout = SplitLayout::new();
+        layout.split_horizontal(0.5);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let rects = layout.rects(area, 2);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(
+            rects[0].1,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 20
+            }
+        );
+        assert_eq!(
+            rects[1].1,
+            Rect {
+                x: 0,
+                y: 22,
+                width: 100,
+                height: 18
+            }
+        );
+    }
+
+    #[test]
+    fn test_close_panel_removes_focused() {
+        let mut layout = SplitLayout::new();
+        let first = layout.focused_panel();
+        let second = layout.split_vertical(0.5);
+        assert_eq!(layout.panel_count(), 2);
+
+        // The focused (new) panel is removed; the other one remains focused.
+        let remaining = layout.close_panel();
+        assert_eq!(remaining, Some(first));
+        assert_eq!(layout.panel_count(), 1);
+        assert_eq!(layout.panels(), vec![first]);
+        assert_ne!(layout.focused_panel(), second);
+    }
+
+    #[test]
+    fn test_close_panel_keeps_focus_valid() {
+        let mut layout = SplitLayout::new();
+        layout.split_horizontal(0.5);
+        layout.split_vertical(0.5);
+        assert_eq!(layout.panel_count(), 3);
+
+        while layout.close_panel().is_some() {}
+        assert_eq!(layout.panel_count(), 1);
+        assert!(layout.panels().contains(&layout.focused_panel()));
     }
 
     #[test]

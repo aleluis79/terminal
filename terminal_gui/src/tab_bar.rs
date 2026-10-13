@@ -38,6 +38,24 @@ impl TabButton {
     }
 }
 
+/// A laid-out tab button, in pixels from the left edge of the bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabRect {
+    /// Index of the tab in the manager.
+    pub index: usize,
+    /// Left edge in pixels.
+    pub x: u32,
+    /// Width in pixels.
+    pub width: u32,
+}
+
+impl TabRect {
+    /// Whether the pixel `x` falls inside this tab.
+    pub fn contains(&self, x: u32) -> bool {
+        x >= self.x && x < self.x + self.width
+    }
+}
+
 /// Tab bar UI component.
 ///
 /// Renders a horizontal bar of tab buttons at the top of the window.
@@ -46,17 +64,12 @@ impl TabButton {
 pub struct TabBar {
     /// Height of the tab bar in pixels.
     height: u32,
-    /// Padding around tab content.
-    #[expect(dead_code)]
+    /// Horizontal padding inside each tab button.
     padding: u32,
-    /// Spacing between tabs.
-    #[expect(dead_code)]
+    /// Spacing between tab buttons.
     spacing: u32,
     /// Font size for tab titles.
     font_size: u32,
-    /// Estimated button width (used for hit testing).
-    #[expect(dead_code)]
-    estimated_button_width: u32,
 }
 
 impl Default for TabBar {
@@ -74,8 +87,6 @@ impl TabBar {
     const DEFAULT_SPACING: u32 = 4;
     /// Default font size.
     const DEFAULT_FONT_SIZE: u32 = 13;
-    /// Estimated minimum button width.
-    const ESTIMATED_BUTTON_WIDTH: u32 = 100;
 
     /// Create a new tab bar with default dimensions.
     pub fn new() -> Self {
@@ -84,7 +95,6 @@ impl TabBar {
             padding: Self::DEFAULT_PADDING,
             spacing: Self::DEFAULT_SPACING,
             font_size: Self::DEFAULT_FONT_SIZE,
-            estimated_button_width: Self::ESTIMATED_BUTTON_WIDTH,
         }
     }
 
@@ -93,43 +103,31 @@ impl TabBar {
         self.height
     }
 
-    /// Convert a window position to a tab index.
+    /// Compute the pixel layout of the tab buttons.
     ///
-    /// Used for hit testing when the user clicks on the tab bar.
-    ///
-    /// # Arguments
-    ///
-    /// * `x` - X coordinate in window pixels.
-    /// * `tab_count` - Number of tabs.
-    /// * `_active_idx` - Index of the active tab (reserved for future use).
-    ///
-    /// # Returns
-    ///
-    /// `Some(index)` if the click is on a tab, `None` otherwise.
-    #[expect(clippy::cast_sign_loss)]
-    pub fn hit_test(x: u32, tab_count: usize, _active_idx: usize) -> Option<usize> {
-        if tab_count == 0 {
-            return None;
+    /// Each tab is as wide as its title (`cell_width` per character) plus
+    /// padding. Tabs that do not fit within `max_width` are dropped. Rendering
+    /// and hit-testing must both use this layout so they stay in sync.
+    pub fn layout(&self, titles: &[&str], cell_width: u32, max_width: u32) -> Vec<TabRect> {
+        let mut rects = Vec::new();
+        let mut x = 0u32;
+
+        for (index, title) in titles.iter().enumerate() {
+            let chars = u32::try_from(title.chars().count()).unwrap_or(u32::MAX);
+            let width = self.padding * 2 + chars * cell_width.max(1);
+            if x + width > max_width {
+                break;
+            }
+            rects.push(TabRect { index, x, width });
+            x += width + self.spacing;
         }
 
-        // Calculate total width needed for all tabs
-        let total_width = tab_count as u32 * Self::ESTIMATED_BUTTON_WIDTH
-            + (tab_count.saturating_sub(1) as u32 * Self::DEFAULT_SPACING);
+        rects
+    }
 
-        // Check if click is within tab bar bounds
-        if x >= total_width {
-            return None;
-        }
-
-        // Determine which tab was clicked
-        let x_per_tab = f64::from(total_width) / f64::from(tab_count as u32);
-        let clicked_idx = (f64::from(x) / x_per_tab) as usize;
-
-        if clicked_idx < tab_count {
-            Some(clicked_idx)
-        } else {
-            None
-        }
+    /// Find the tab at pixel `x` within a layout from [`layout`](Self::layout).
+    pub fn hit_test(&self, x: u32, rects: &[TabRect]) -> Option<usize> {
+        rects.iter().find(|r| r.contains(x)).map(|r| r.index)
     }
 
     /// Build tab buttons from a tab manager.
@@ -182,23 +180,46 @@ mod tests {
     }
 
     #[test]
-    fn test_tab_bar_hit_test_no_tabs() {
-        assert!(TabBar::hit_test(0, 0, 0).is_none());
+    fn test_tab_bar_layout_and_hit_test() {
+        let bar = TabBar::new();
+        let titles = ["Terminal", "Terminal 2", "Terminal 3"];
+
+        // "Terminal" = 8 chars: padding*2 (16) + 8 * 10px = 96.
+        let rects = bar.layout(&titles, 10, 1000);
+        assert_eq!(rects.len(), 3);
+        assert_eq!(rects[0].x, 0);
+        assert_eq!(rects[0].width, 96);
+        // 96 + spacing (4) = 100.
+        assert_eq!(rects[1].x, 100);
+        assert_eq!(rects[1].width, 16 + 10 * 10);
+
+        assert_eq!(bar.hit_test(50, &rects), Some(0));
+        assert_eq!(bar.hit_test(120, &rects), Some(1));
+        assert_eq!(bar.hit_test(300, &rects), Some(2));
+        assert!(bar.hit_test(9999, &rects).is_none());
     }
 
     #[test]
-    fn test_tab_bar_hit_test_single_tab() {
-        assert_eq!(TabBar::hit_test(50, 1, 0), Some(0));
-        assert!(TabBar::hit_test(500, 1, 0).is_none());
+    fn test_tab_bar_layout_drops_overflowing_tabs() {
+        let bar = TabBar::new();
+        let titles = ["Terminal", "Terminal 2"];
+        // Only room for the first tab (96px wide).
+        let rects = bar.layout(&titles, 10, 100);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].index, 0);
     }
 
     #[test]
-    fn test_tab_bar_hit_test_multiple_tabs() {
-        // 3 tabs, each ~104px wide (100 + 4 spacing)
-        assert_eq!(TabBar::hit_test(50, 3, 1), Some(0));
-        assert_eq!(TabBar::hit_test(150, 3, 1), Some(1));
-        assert_eq!(TabBar::hit_test(250, 3, 1), Some(2));
-        assert!(TabBar::hit_test(500, 3, 1).is_none());
+    fn test_tab_rect_contains() {
+        let rect = TabRect {
+            index: 0,
+            x: 10,
+            width: 20,
+        };
+        assert!(!rect.contains(9));
+        assert!(rect.contains(10));
+        assert!(rect.contains(29));
+        assert!(!rect.contains(30));
     }
 
     #[test]

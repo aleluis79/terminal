@@ -407,17 +407,21 @@ fn test_split_navigate() {
 fn test_split_close_panel() {
     let mut layout = SplitLayout::new();
     layout.split_horizontal(0.5); // 2 panels
+    assert_eq!(layout.panel_count(), 2);
 
-    // Can't close single panel
+    // Closing the focused panel removes it and leaves the other one.
+    assert!(layout.close_panel().is_some());
+    assert_eq!(layout.panel_count(), 1);
+
+    // The last panel cannot be closed.
     assert!(layout.close_panel().is_none());
+    assert_eq!(layout.panel_count(), 1);
 
-    // Create another split
-    layout.split_vertical(0.5); // 3 panels
-
-    // Can now close a panel (if the implementation supports it)
-    // Note: close_panel behavior may vary by implementation
-    let _ = layout.close_panel();
-    assert!(layout.panel_count() <= 3);
+    // Splitting again works, and closing brings us back to one panel.
+    layout.split_vertical(0.5);
+    assert_eq!(layout.panel_count(), 2);
+    assert!(layout.close_panel().is_some());
+    assert_eq!(layout.panel_count(), 1);
 }
 
 #[test]
@@ -485,13 +489,15 @@ fn test_event_processor_mouse_selection() {
         (15.0, 25.0),
         10.0,
         20.0,
+        24,
+        80,
     );
     assert!(event.selection_active);
     assert!(processor.selection().is_active());
     assert_eq!(processor.selection().bounds(), Some((1, 1, 1, 1)));
 
     // Drag selection
-    processor.update_selection((50.0, 80.0), 10.0, 20.0);
+    processor.update_selection((50.0, 80.0), 10.0, 20.0, 24, 80);
     assert!(processor.selection().is_active());
     assert_eq!(processor.selection().bounds(), Some((1, 1, 4, 5)));
 
@@ -502,6 +508,8 @@ fn test_event_processor_mouse_selection() {
         (50.0, 80.0),
         10.0,
         20.0,
+        24,
+        80,
     );
     assert!(event.selection_active);
 }

@@ -245,6 +245,28 @@ impl TabManager {
         self.active_idx = idx;
     }
 
+    /// Close the tab with the given ID.
+    ///
+    /// Returns the new active index, or `None` if no tabs remain.
+    pub fn close_tab(&mut self, id: TabId) -> Option<usize> {
+        let Some(idx) = self.tabs.iter().position(|tab| tab.id() == id) else {
+            return self.active_idx();
+        };
+
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active_idx = 0;
+            return None;
+        }
+
+        if self.active_idx >= self.tabs.len() {
+            self.active_idx = self.tabs.len() - 1;
+        } else if idx < self.active_idx {
+            self.active_idx -= 1;
+        }
+        Some(self.active_idx)
+    }
+
     /// Switch to the next tab (wrap around).
     pub fn switch_next(&mut self) {
         if self.tabs.is_empty() {

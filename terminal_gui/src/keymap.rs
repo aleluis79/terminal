@@ -177,11 +177,11 @@ impl Keymap {
                 action: GuiAction::CloseTab,
             },
             KeyBinding {
-                key: KeyCombination::new("Tab", ModifiersState::SHIFT),
+                key: KeyCombination::new("Tab", ctrl_shift),
                 action: GuiAction::PrevTab,
             },
             KeyBinding {
-                key: KeyCombination::new("n", ctrl_shift),
+                key: KeyCombination::new("Tab", ModifiersState::CONTROL),
                 action: GuiAction::NextTab,
             },
             // Panel management (RF-6, RF-7, RF-8, RF-10)
@@ -344,6 +344,27 @@ mod tests {
         let keymap = Keymap::default();
         let action = keymap.resolve(&Key::Character("z".into()), &ModifiersState::empty());
         assert_eq!(action, GuiAction::None);
+    }
+
+    #[test]
+    fn test_keymap_tab_shortcuts() {
+        let keymap = Keymap::default();
+        let ctrl = ModifiersState::CONTROL;
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        // New tab is its own shortcut, not shadowed by "next tab".
+        assert_eq!(
+            keymap.resolve(&Key::Character("n".into()), &ctrl_shift),
+            GuiAction::NewTab
+        );
+        assert_eq!(
+            keymap.resolve(&Key::Named(NamedKey::Tab), &ctrl),
+            GuiAction::NextTab
+        );
+        assert_eq!(
+            keymap.resolve(&Key::Named(NamedKey::Tab), &ctrl_shift),
+            GuiAction::PrevTab
+        );
     }
 
     #[test]

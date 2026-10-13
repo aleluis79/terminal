@@ -33,10 +33,16 @@ pub enum Action {
     CursorToColumn(usize),
     /// Send cursor to beginning of line.
     CursorHome,
-    /// Clear from cursor to end of line.
-    EraseInLine,
-    /// Clear entire screen.
-    EraseInDisplay,
+    /// Erase part of the current line (EL).
+    ///
+    /// The value is the ECMA-48 mode: `0` = cursor→end, `1` = start→cursor,
+    /// `2` = whole line.
+    EraseInLine(u8),
+    /// Erase part of the display (ED).
+    ///
+    /// The value is the ECMA-48 mode: `0` = cursor→end, `1` = start→cursor,
+    /// `2` = whole screen.
+    EraseInDisplay(u8),
     /// Insert n lines.
     InsertLines(usize),
     /// Delete n lines.
@@ -104,6 +110,9 @@ enum ParserState {
     Normal,
     /// Received ESC, waiting for next byte.
     Escape,
+    /// Received ESC followed by an intermediate byte (e.g. `ESC ( `), waiting
+    /// for the final byte of the sequence.
+    EscapeIntermediate,
     /// Received ESC [, CSI prefix.
     Csi,
     /// Received ESC ], OSC prefix.
@@ -151,6 +160,12 @@ impl Parser {
             }
             ParserState::Csi => self.parse_csi(byte),
             ParserState::Osc => self.parse_osc(byte),
+            ParserState::EscapeIntermediate => {
+                // Consume the final byte of `ESC <intermediate> <final>`
+                // (charset and similar designators) and ignore the sequence.
+                self.state = ParserState::Normal;
+                Vec::new()
+            }
         }
     }
 
@@ -271,6 +286,13 @@ impl Parser {
                 self.reset();
                 vec![Action::ResetAttributes]
             }
+            0x20..=0x2f => {
+                // Intermediate byte: `ESC <intermediate> <final>` (character
+                // set designators like `ESC ( B`, `ESC ) 0`, `ESC # 8`, …).
+                // Consume the final byte so it is not mistaken for text.
+                self.state = ParserState::EscapeIntermediate;
+                Vec::new()
+            }
             _ => {
                 // Unknown ESC sequence
                 Vec::new()
@@ -318,11 +340,11 @@ impl Parser {
             return Vec::new();
         }
 
-        let params = if self.csi_params.is_empty() {
-            vec![0]
-        } else {
-            self.csi_params.clone()
-        };
+        // Keep the parameter list empty when the sequence has none, so each
+        // command's own default applies. ECMA-48 gives CUU/CUD/CUF/CUB (and
+        // IL/DL) a default parameter of 1, while ED/EL default to 0. Forcing
+        // `vec![0]` here would turn a bare `ESC [ C` into a no-op.
+        let params = self.csi_params.clone();
 
         match final_byte {
             // SGR (Select Graphic Rendition)
@@ -364,14 +386,14 @@ impl Parser {
                 let col = params.get(1).copied().unwrap_or(1).saturating_sub(1) as usize;
                 vec![Action::CursorPosition(row, col)]
             }
-            // ECH (Erase Character) / ED (Erase in Display)
+            // ED (Erase in Display)
             b'J' => match params.first().copied().unwrap_or(0) {
-                0..=2 => vec![Action::EraseInDisplay],
+                mode @ 0..=2 => vec![Action::EraseInDisplay(mode as u8)],
                 _ => Vec::new(),
             },
             // EL (Erase in Line)
             b'K' => match params.first().copied().unwrap_or(0) {
-                0..=2 => vec![Action::EraseInLine],
+                mode @ 0..=2 => vec![Action::EraseInLine(mode as u8)],
                 _ => Vec::new(),
             },
             // IL (Insert Line)
@@ -652,6 +674,71 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cursor_forward_default_one() {
+        // ECMA-48: a bare `ESC [ C` (CUF) moves one column, not zero. Readline
+        // relies on this to reposition the cursor after each echo.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[C"),
+            vec![Action::CursorForward(1)]
+        );
+    }
+
+    #[test]
+    fn test_parse_cursor_default_one_for_abcd() {
+        let mut parser = Parser::new();
+        assert_eq!(parser.parse_bytes(b"\x1b[A"), vec![Action::CursorUp(1)]);
+        assert_eq!(parser.parse_bytes(b"\x1b[B"), vec![Action::CursorDown(1)]);
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[C"),
+            vec![Action::CursorForward(1)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[D"),
+            vec![Action::CursorBackward(1)]
+        );
+    }
+
+    #[test]
+    fn test_parse_insert_delete_line_default_one() {
+        let mut parser = Parser::new();
+        assert_eq!(parser.parse_bytes(b"\x1b[L"), vec![Action::InsertLines(1)]);
+        assert_eq!(parser.parse_bytes(b"\x1b[M"), vec![Action::DeleteLines(1)]);
+    }
+
+    #[test]
+    fn test_parse_erase_defaults_stay_zero() {
+        // ED/EL keep a default of 0 (erase from cursor), unlike cursor moves.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[J"),
+            vec![Action::EraseInDisplay(0)]
+        );
+        assert_eq!(parser.parse_bytes(b"\x1b[K"), vec![Action::EraseInLine(0)]);
+    }
+
+    #[test]
+    fn test_parse_erase_modes_are_preserved() {
+        // Full-screen apps (top, vim) rely on the exact erase mode.
+        let mut parser = Parser::new();
+        assert_eq!(parser.parse_bytes(b"\x1b[0K"), vec![Action::EraseInLine(0)]);
+        assert_eq!(parser.parse_bytes(b"\x1b[1K"), vec![Action::EraseInLine(1)]);
+        assert_eq!(parser.parse_bytes(b"\x1b[2K"), vec![Action::EraseInLine(2)]);
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[0J"),
+            vec![Action::EraseInDisplay(0)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[1J"),
+            vec![Action::EraseInDisplay(1)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[2J"),
+            vec![Action::EraseInDisplay(2)]
+        );
+    }
+
+    #[test]
     fn test_parse_cursor_column() {
         let mut parser = Parser::new();
         // CHA must move to the column only (not reset the row).
@@ -745,6 +832,20 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Action::HyperlinkStart(_))));
         assert!(actions.iter().any(|a| matches!(a, Action::HyperlinkEnd)));
+    }
+
+    #[test]
+    fn test_parse_charset_designator_is_ignored() {
+        // `ESC ( B` selects the ASCII charset; it must not leak the 'B' as text.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"A\x1b(BB"),
+            vec![Action::Write('A'), Action::Write('B')]
+        );
+        // `ESC ) 0` (G1 designator) is ignored too.
+        assert_eq!(parser.parse_bytes(b"\x1b)0Z"), vec![Action::Write('Z')]);
+        // `ESC # 8` (DECALN) is ignored.
+        assert_eq!(parser.parse_bytes(b"\x1b#8X"), vec![Action::Write('X')]);
     }
 
     #[test]

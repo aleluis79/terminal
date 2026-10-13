@@ -55,10 +55,12 @@ impl GlyphRenderer {
     /// * `font` - The font handle to rasterize with.
     /// * `ch` - The character to rasterize.
     pub fn rasterize(&mut self, font: &FontHandle, ch: char) -> Option<RasterGlyph> {
+        // Per-glyph fallback (CL-5): use whichever face actually has the glyph.
+        let face = font.face_for_char(ch)?;
         let size = self.font_size;
         let context = &mut self.context;
 
-        font.with_face_data(|data, index| {
+        font.with_face_data_for(face, |data, index| {
             let font_ref = swash::FontRef::from_index(data, index as usize)?;
             let glyph_id = font_ref.charmap().map(ch);
             if glyph_id == 0 {
@@ -232,6 +234,19 @@ mod tests {
         assert!(glyph.height > 0);
         assert_eq!(glyph.data.len(), (glyph.width * glyph.height) as usize);
         // The mask must contain some coverage, not be entirely empty.
+        assert!(glyph.data.iter().any(|&px| px > 0));
+    }
+
+    #[test]
+    fn test_rasterize_latin1_glyph() {
+        // Regression: a non-ASCII letter must rasterize like any other glyph.
+        let font = FontHandle::new(&FontConfig::default());
+        let mut renderer = GlyphRenderer::new(font.pixel_size());
+        let glyph = renderer
+            .rasterize(&font, 'ñ')
+            .expect("'ñ' should rasterize to a bitmap");
+        assert!(glyph.width > 0);
+        assert!(glyph.height > 0);
         assert!(glyph.data.iter().any(|&px| px > 0));
     }
 

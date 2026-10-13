@@ -82,26 +82,84 @@ pub struct CellContent {
     pub bg: u8,
 }
 
-/// Renderable terminal content.
-pub struct RenderContent<'a> {
-    /// The terminal grid cells.
+/// A tab label drawn in the tab bar.
+#[derive(Debug, Clone, Copy)]
+pub struct TabLabel<'a> {
+    /// Title text.
+    pub title: &'a str,
+    /// Left edge in pixels.
+    pub x: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Whether this tab is the active one.
+    pub active: bool,
+}
+
+/// Tab bar drawn above the terminal grid.
+#[derive(Debug, Clone, Copy)]
+pub struct TabBarContent<'a> {
+    /// Tabs to draw, left to right.
+    pub tabs: &'a [TabLabel<'a>],
+    /// Bar height in pixels.
+    pub height: u32,
+    /// Cell width in pixels (advance used for title glyphs).
+    pub cell_width: u32,
+}
+
+/// Pixel rectangle of a pane within the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneRect {
+    /// Left edge in pixels.
+    pub x: u32,
+    /// Top edge in pixels.
+    pub y: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// A terminal grid pane to draw.
+pub struct GridPane<'a> {
+    /// The pane's cells, row-major.
     pub cells: &'a [CellContent],
-    /// Cursor row position.
-    pub cursor_row: usize,
-    /// Cursor column position.
-    pub cursor_col: usize,
-    /// Cursor shape.
-    pub cursor_shape: CursorShape,
-    /// Cursor visible.
-    pub cursor_visible: bool,
-    /// Current selection.
-    pub selection: Selection,
-    /// Background color (RGBA-ordered).
-    pub background_color: Color,
-    /// Dimensions (rows, cols).
+    /// Number of rows.
     pub rows: usize,
     /// Number of columns.
     pub cols: usize,
+    /// Pixel rectangle of the pane.
+    pub rect: PaneRect,
+    /// Cursor row position within the pane.
+    pub cursor_row: usize,
+    /// Cursor column position within the pane.
+    pub cursor_col: usize,
+    /// Cursor shape.
+    pub cursor_shape: CursorShape,
+    /// Whether to draw the cursor (only the focused pane does).
+    pub cursor_visible: bool,
+    /// Current selection within the pane.
+    pub selection: Selection,
+}
+
+/// Renderable terminal content.
+pub struct RenderContent<'a> {
+    /// Panes to draw, back to front.
+    pub panes: &'a [GridPane<'a>],
+    /// Background color (RGBA-ordered).
+    pub background_color: Color,
+    /// Tab bar to draw above the panes, if any.
+    pub tab_bar: Option<TabBarContent<'a>>,
+}
+
+/// A contiguous range of indices to draw, optionally clipped to a rectangle.
+#[derive(Debug, Clone, Copy)]
+struct DrawBatch {
+    /// First index in the index buffer.
+    first_index: u32,
+    /// Number of indices in the batch.
+    index_count: u32,
+    /// Scissor rectangle in pixels, if the batch must be clipped.
+    scissor: Option<PaneRect>,
 }
 
 /// Vertex for a quad in the screen-space render.
@@ -243,6 +301,8 @@ pub struct TerminalRenderer {
     cell_height: u32,
     /// Distance from the top of a cell to the text baseline.
     ascent: f32,
+    /// Cursor color as normalized RGBA.
+    cursor_color: [f32; 4],
     /// Glyph cache: character → atlas entry (or `None` if unrenderable).
     glyph_cache: HashMap<char, Option<CachedGlyph>>,
 }
@@ -364,8 +424,10 @@ impl TerminalRenderer {
                             operation: wgpu::BlendOperation::Add,
                         },
                         alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            // Preserve the cleared alpha so the window keeps a
+                            // uniform opacity no matter what is drawn over it.
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::One,
                             operation: wgpu::BlendOperation::Add,
                         },
                     }),
@@ -434,6 +496,7 @@ impl TerminalRenderer {
             cell_width,
             cell_height,
             ascent,
+            cursor_color: [0.75, 0.75, 0.95, 0.6],
             glyph_cache: HashMap::new(),
         }
     }
@@ -457,12 +520,14 @@ impl TerminalRenderer {
         // Rasterize and upload any glyphs not yet in the atlas.
         self.upload_glyphs(content);
 
+        let viewport = (config.width.max(1), config.height.max(1));
+
         // Build all geometry for this frame (in pixel coordinates).
-        let (mut vertices, indices) = self.build_geometry(content);
+        let (mut vertices, indices, batches) = self.build_geometry(content, viewport);
 
         // Convert pixel coordinates to normalized device coordinates.
-        let viewport_w = (config.width.max(1)) as f32;
-        let viewport_h = (config.height.max(1)) as f32;
+        let viewport_w = viewport.0 as f32;
+        let viewport_h = viewport.1 as f32;
         for vertex in &mut vertices {
             vertex.x = vertex.x / viewport_w * 2.0 - 1.0;
             vertex.y = 1.0 - vertex.y / viewport_h * 2.0;
@@ -499,7 +564,8 @@ impl TerminalRenderer {
                             r: f64::from(bg[0]),
                             g: f64::from(bg[1]),
                             b: f64::from(bg[2]),
-                            a: 1.0,
+                            // Alpha carries the window opacity.
+                            a: f64::from(bg[3]),
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -514,8 +580,31 @@ impl TerminalRenderer {
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-            if self.index_count > 0 {
-                pass.draw_indexed(0..self.index_count, 0, 0..1);
+            for batch in &batches {
+                if batch.index_count == 0 {
+                    continue;
+                }
+
+                let (x, y, w, h) = match batch.scissor {
+                    Some(rect) => (rect.x, rect.y, rect.width.max(1), rect.height.max(1)),
+                    None => (0, 0, viewport.0, viewport.1),
+                };
+
+                // Keep the scissor inside the render target.
+                let x = x.min(viewport.0);
+                let y = y.min(viewport.1);
+                let w = w.min(viewport.0 - x);
+                let h = h.min(viewport.1 - y);
+                if w == 0 || h == 0 {
+                    continue;
+                }
+
+                pass.set_scissor_rect(x, y, w, h);
+                pass.draw_indexed(
+                    batch.first_index..batch.first_index + batch.index_count,
+                    0,
+                    0..1,
+                );
             }
         }
 
@@ -524,68 +613,122 @@ impl TerminalRenderer {
 
     /// Rasterize and upload glyphs for every unique character on screen.
     fn upload_glyphs(&mut self, content: &RenderContent) {
-        for cell in content.cells {
-            if cell.ch == ' ' || cell.ch == '\0' || self.glyph_cache.contains_key(&cell.ch) {
-                continue;
+        for pane in content.panes {
+            for cell in pane.cells {
+                self.upload_glyph(cell.ch);
             }
+        }
 
-            let cached = match self.glyph_renderer.rasterize(&self.font, cell.ch) {
-                Some(glyph) if glyph.width > 0 && glyph.height > 0 => self
-                    .atlas
-                    .allocate(glyph.width, glyph.height)
-                    .map(|region| {
-                        self.atlas.upload(&region, &glyph.data, &self.queue);
-                        CachedGlyph {
-                            region,
-                            width: glyph.width as f32,
-                            height: glyph.height as f32,
-                            left: glyph.left as f32,
-                            top: glyph.top as f32,
-                        }
-                    }),
-                _ => None,
-            };
-
-            self.glyph_cache.insert(cell.ch, cached);
+        if let Some(bar) = &content.tab_bar {
+            for tab in bar.tabs {
+                for ch in tab.title.chars() {
+                    self.upload_glyph(ch);
+                }
+            }
         }
     }
 
+    /// Rasterize and upload a single glyph if it is not cached yet.
+    fn upload_glyph(&mut self, ch: char) {
+        if ch == ' ' || ch == '\0' || self.glyph_cache.contains_key(&ch) {
+            return;
+        }
+
+        let cached = match self.glyph_renderer.rasterize(&self.font, ch) {
+            Some(glyph) if glyph.width > 0 && glyph.height > 0 => self
+                .atlas
+                .allocate(glyph.width, glyph.height)
+                .map(|region| {
+                    self.atlas.upload(&region, &glyph.data, &self.queue);
+                    CachedGlyph {
+                        region,
+                        width: glyph.width as f32,
+                        height: glyph.height as f32,
+                        left: glyph.left as f32,
+                        top: glyph.top as f32,
+                    }
+                }),
+            _ => None,
+        };
+
+        self.glyph_cache.insert(ch, cached);
+    }
+
     /// Build the vertex and index geometry for the whole frame.
-    fn build_geometry(&self, content: &RenderContent) -> (Vec<QuadVertex>, Vec<u32>) {
+    fn build_geometry(
+        &self,
+        content: &RenderContent,
+        viewport: (u32, u32),
+    ) -> (Vec<QuadVertex>, Vec<u32>, Vec<DrawBatch>) {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
+        let mut batches = Vec::new();
 
+        for pane in content.panes {
+            let first_index = indices.len() as u32;
+            self.push_pane(pane, &mut vertices, &mut indices);
+            batches.push(DrawBatch {
+                first_index,
+                index_count: indices.len() as u32 - first_index,
+                scissor: Some(pane.rect),
+            });
+        }
+
+        if let Some(bar) = &content.tab_bar {
+            let bar_width = content
+                .panes
+                .iter()
+                .map(|p| p.rect.x + p.rect.width)
+                .max()
+                .unwrap_or(viewport.0);
+            let first_index = indices.len() as u32;
+            self.push_tab_bar(bar, bar_width, &mut vertices, &mut indices);
+            batches.push(DrawBatch {
+                first_index,
+                index_count: indices.len() as u32 - first_index,
+                scissor: None,
+            });
+        }
+
+        (vertices, indices, batches)
+    }
+
+    /// Push one pane: backgrounds, glyphs, selection and cursor.
+    fn push_pane(&self, pane: &GridPane, vertices: &mut Vec<QuadVertex>, indices: &mut Vec<u32>) {
         let cell_w = self.cell_width as f32;
         let cell_h = self.cell_height as f32;
         let baseline = self.ascent;
+        let origin_x = pane.rect.x as f32;
+        let origin_y = pane.rect.y as f32;
 
         let white = self.atlas.white_region();
         let white_uv = (
             (white.uv_left + white.uv_right) * 0.5,
             (white.uv_bottom + white.uv_top) * 0.5,
         );
+        let solid = (white_uv.0, white_uv.1, white_uv.0, white_uv.1);
 
-        let cols = content.cols;
-        for row in 0..content.rows {
+        let cols = pane.cols;
+        for row in 0..pane.rows {
             for col in 0..cols {
                 let idx = row * cols + col;
-                let Some(cell) = content.cells.get(idx) else {
+                let Some(cell) = pane.cells.get(idx) else {
                     continue;
                 };
 
-                let cell_x = col as f32 * cell_w;
-                let cell_y = row as f32 * cell_h;
+                let cell_x = origin_x + col as f32 * cell_w;
+                let cell_y = origin_y + row as f32 * cell_h;
 
                 // Per-cell background (index 0 means "terminal background").
                 if cell.bg != 0 {
                     self.push_quad(
-                        &mut vertices,
-                        &mut indices,
+                        vertices,
+                        indices,
                         cell_x,
                         cell_y,
                         cell_w,
                         cell_h,
-                        (white_uv.0, white_uv.1, white_uv.0, white_uv.1),
+                        solid,
                         self.color(cell.bg),
                     );
                 }
@@ -593,13 +736,11 @@ impl TerminalRenderer {
                 // Glyph.
                 if cell.ch != ' ' && cell.ch != '\0' {
                     if let Some(Some(glyph)) = self.glyph_cache.get(&cell.ch) {
-                        let x = cell_x + glyph.left;
-                        let y = cell_y + baseline - glyph.top;
                         self.push_quad(
-                            &mut vertices,
-                            &mut indices,
-                            x,
-                            y,
+                            vertices,
+                            indices,
+                            cell_x + glyph.left,
+                            cell_y + baseline - glyph.top,
                             glyph.width,
                             glyph.height,
                             (
@@ -615,88 +756,121 @@ impl TerminalRenderer {
             }
         }
 
-        self.push_selection(
-            content,
-            &mut vertices,
-            &mut indices,
-            cell_w,
-            cell_h,
-            white_uv,
-        );
-        self.push_cursor(
-            content,
-            &mut vertices,
-            &mut indices,
-            cell_w,
-            cell_h,
-            white_uv,
-        );
+        // Selection highlight.
+        if let Some((r1, c1, r2, c2)) = pane.selection.bounds() {
+            let color = [0.25, 0.45, 0.85, 0.35];
+            for row in r1..=r2.min(pane.rows.saturating_sub(1)) {
+                self.push_quad(
+                    vertices,
+                    indices,
+                    origin_x + c1 as f32 * cell_w,
+                    origin_y + row as f32 * cell_h,
+                    (c2 - c1 + 1) as f32 * cell_w,
+                    cell_h,
+                    solid,
+                    color,
+                );
+            }
+        }
 
-        (vertices, indices)
-    }
-
-    /// Push selection-highlight quads.
-    fn push_selection(
-        &self,
-        content: &RenderContent,
-        vertices: &mut Vec<QuadVertex>,
-        indices: &mut Vec<u32>,
-        cell_w: f32,
-        cell_h: f32,
-        white_uv: (f32, f32),
-    ) {
-        let Some((r1, c1, r2, c2)) = content.selection.bounds() else {
-            return;
-        };
-        let color = [0.25, 0.45, 0.85, 0.35];
-
-        for row in r1..=r2.min(content.rows.saturating_sub(1)) {
-            let x = c1 as f32 * cell_w;
-            let width = (c2 - c1 + 1) as f32 * cell_w;
-            let y = row as f32 * cell_h;
-            self.push_quad(
-                vertices,
-                indices,
-                x,
-                y,
-                width,
-                cell_h,
-                (white_uv.0, white_uv.1, white_uv.0, white_uv.1),
-                color,
-            );
+        // Cursor (shape depends on [`CursorShape`]).
+        if pane.cursor_visible {
+            let x = origin_x + pane.cursor_col as f32 * cell_w;
+            let y = origin_y + pane.cursor_row as f32 * cell_h;
+            let color = self.cursor_color;
+            match pane.cursor_shape {
+                CursorShape::Block => {
+                    self.push_quad(vertices, indices, x, y, cell_w, cell_h, solid, color);
+                }
+                CursorShape::Underline => {
+                    let h = (cell_h * 0.12).max(2.0);
+                    self.push_quad(
+                        vertices,
+                        indices,
+                        x,
+                        y + cell_h - h,
+                        cell_w,
+                        h,
+                        solid,
+                        color,
+                    );
+                }
+                CursorShape::Beam => {
+                    let w = (cell_w * 0.15).max(2.0);
+                    self.push_quad(vertices, indices, x, y, w, cell_h, solid, color);
+                }
+            }
         }
     }
 
-    /// Push the cursor quad (shape depends on [`CursorShape`]).
-    fn push_cursor(
+    /// Push the tab bar (background, tab buttons and titles) above the grid.
+    fn push_tab_bar(
         &self,
-        content: &RenderContent,
+        bar: &TabBarContent,
+        bar_width: u32,
         vertices: &mut Vec<QuadVertex>,
         indices: &mut Vec<u32>,
-        cell_w: f32,
-        cell_h: f32,
-        white_uv: (f32, f32),
     ) {
-        if !content.cursor_visible {
-            return;
-        }
+        let bar_h = bar.height as f32;
+        let total_w = bar_width as f32;
 
-        let x = content.cursor_col as f32 * cell_w;
-        let y = content.cursor_row as f32 * cell_h;
-        let uv = (white_uv.0, white_uv.1, white_uv.0, white_uv.1);
-        let color = [0.75, 0.75, 0.95, 0.6];
+        let white = self.atlas.white_region();
+        let uv = (
+            (white.uv_left + white.uv_right) * 0.5,
+            (white.uv_bottom + white.uv_top) * 0.5,
+        );
+        let solid = (uv.0, uv.1, uv.0, uv.1);
 
-        match content.cursor_shape {
-            CursorShape::Block => {
-                self.push_quad(vertices, indices, x, y, cell_w, cell_h, uv, color);
-            }
-            CursorShape::Underline => {
-                let h = (cell_h * 0.12).max(2.0);
-                self.push_quad(vertices, indices, x, y + cell_h - h, cell_w, h, uv, color);
-            }
-            CursorShape::Beam => {
-                let w = (cell_w * 0.15).max(2.0);
-                self.push_quad(vertices, indices, x, y, w, cell_h, uv, color);
+        // Bar background.
+        self.push_quad(
+            vertices,
+            indices,
+            0.0,
+            0.0,
+            total_w,
+            bar_h,
+            solid,
+            self.color(0),
+        );
+
+        // Vertically centre the title text within the bar.
+        let baseline = (bar_h - self.cell_height as f32) * 0.5 + self.ascent;
+        let title_w = bar.cell_width as f32;
+
+        for tab in bar.tabs {
+            let x = tab.x as f32;
+            let w = tab.width as f32;
+
+            // Highlight the active tab.
+            let (bg, fg) = if tab.active {
+                (self.color(8), self.color(15))
+            } else {
+                (self.color(0), self.color(7))
+            };
+            self.push_quad(vertices, indices, x, 0.0, w, bar_h, solid, bg);
+
+            // Centre the title inside the tab.
+            let text_w = tab.title.chars().count() as f32 * title_w;
+            let mut pen = x + (w - text_w) * 0.5;
+            for ch in tab.title.chars() {
+                if let Some(Some(glyph)) = self.glyph_cache.get(&ch) {
+                    self.push_quad(
+                        vertices,
+                        indices,
+                        pen + glyph.left,
+                        baseline - glyph.top,
+                        glyph.width,
+                        glyph.height,
+                        (
+                            glyph.region.uv_left,
+                            glyph.region.uv_bottom,
+                            glyph.region.uv_right,
+                            glyph.region.uv_top,
+                        ),
+                        fg,
+                    );
+                }
+                pen += title_w;
             }
         }
     }
@@ -804,6 +978,11 @@ impl TerminalRenderer {
     /// Get the current palette.
     pub fn palette(&self) -> &TerminalPalette {
         &self.palette
+    }
+
+    /// Set the cursor color (normalized RGBA).
+    pub fn set_cursor_color(&mut self, color: [f32; 4]) {
+        self.cursor_color = color;
     }
 }
 

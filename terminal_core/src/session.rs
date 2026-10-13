@@ -95,7 +95,28 @@ impl TerminalSession {
     pub fn spawn_shell(&mut self, shell: &str) -> Result<(), terminal_pty::PtyError> {
         let pty = UnixPty::spawn(shell)?;
         self.pty = Some(pty);
+        // Tell the shell the real terminal size before it draws anything.
+        let (rows, cols) = self.engine.dimensions();
+        self.resize(rows, cols);
         Ok(())
+    }
+
+    /// Resize the terminal screen.
+    ///
+    /// On Unix the child process is also notified of the new window size, so
+    /// programs can reflow their output.
+    pub fn resize(&mut self, rows: usize, cols: usize) {
+        self.engine.resize(rows, cols);
+
+        #[cfg(unix)]
+        {
+            let (rows, cols) = self.engine.dimensions();
+            let rows = u16::try_from(rows).unwrap_or(u16::MAX);
+            let cols = u16::try_from(cols).unwrap_or(u16::MAX);
+            if let Some(pty) = self.pty.as_mut() {
+                let _ = pty.resize(rows, cols);
+            }
+        }
     }
 
     /// Feed bytes from the PTY into the session.
@@ -299,6 +320,13 @@ mod tests {
     }
 
     #[test]
+    fn test_session_resize_updates_dimensions() {
+        let mut session = TerminalSession::new(24, 80);
+        session.resize(10, 40);
+        assert_eq!(session.dimensions(), (10, 40));
+    }
+
+    #[test]
     fn test_session_feed() {
         let mut session = TerminalSession::new(24, 80);
         session.feed(b"Hello");
@@ -480,6 +508,31 @@ mod tests {
                 panic!("Expected PollResult::Exited, got {other:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_session_exit_surfaces_after_output_drained() {
+        // Regression: once the child's last output has been read, the session
+        // must still report the exit instead of getting stuck on WouldBlock.
+        let mut session = TerminalSession::new(24, 80);
+        session.spawn_shell("/bin/echo").expect("spawn failed");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let mut exit_code = None;
+        for _ in 0..50 {
+            match session.poll_pty().expect("poll failed") {
+                PollResult::Exited { exit_code: code } => {
+                    exit_code = Some(code);
+                    break;
+                }
+                PollResult::Data(_) | PollResult::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+
+        assert_eq!(exit_code, Some(0));
+        assert!(!session.is_running());
     }
 
     #[test]

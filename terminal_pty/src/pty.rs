@@ -50,6 +50,20 @@ pub trait Pty: Send + 'static {
     /// Send EOF to the child process.
     fn send_eof(&mut self);
 
+    /// Resize the pseudo-terminal window.
+    ///
+    /// This informs the child process of the new terminal size so programs can
+    /// reflow their output. Platforms without window-size support keep the
+    /// previous size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the new size cannot be applied.
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<(), PtyError> {
+        let _ = (rows, cols);
+        Ok(())
+    }
+
     /// Wait for the child process to exit.
     ///
     /// # Errors
@@ -76,4 +90,8 @@ pub enum PtyError {
     /// Write error.
     #[error("Failed to write to PTY: {0}")]
     Write(String),
+
+    /// Resize error.
+    #[error("Failed to resize PTY: {0}")]
+    Resize(String),
 }

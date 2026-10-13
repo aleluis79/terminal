@@ -12,7 +12,7 @@ use std::sync::Arc;
 use terminal_render::color::pack_rgba;
 use terminal_render::font::FontConfig;
 use terminal_render::renderer::{
-    CellContent, CursorShape, RenderContent, Selection, TerminalRenderer,
+    CellContent, CursorShape, GridPane, PaneRect, RenderContent, Selection, TerminalRenderer,
 };
 
 #[expect(
@@ -78,16 +78,27 @@ fn main() {
     cells[5].ch = 'X';
     cells[5].bg = 1; // red background to test bg quads
 
-    let content = RenderContent {
+    let panes = [GridPane {
         cells: &cells,
+        rows,
+        cols,
+        rect: PaneRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
         cursor_row: 0,
         cursor_col: 3,
         cursor_shape: CursorShape::Block,
         cursor_visible: true,
         selection: Selection::default(),
+    }];
+
+    let content = RenderContent {
+        panes: &panes,
         background_color: pack_rgba(0x10, 0x10, 0x20, 0xFF),
-        rows,
-        cols,
+        tab_bar: None,
     };
     let config = wgpu::SurfaceConfiguration {
         width,

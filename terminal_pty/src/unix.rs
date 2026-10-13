@@ -196,19 +196,18 @@ impl Pty for UnixPty {
     ///
     /// Returns an error if a read error occurs that is not EAGAIN or EIO.
     fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, PtyError> {
-        // First check if child has exited
-        let Some(_code) = self.check_child_exit()? else {
-            return self.do_read(buf);
-        };
+        // Reap the child if it has exited. Once its PID is gone the terminal
+        // has been drained, so reading with no data left means end of stream
+        // (this is what surfaces `PollResult::Exited` to the session).
+        let _ = self.check_child_exit()?;
+        let child_gone = self.pid.is_none();
 
-        // We got an exit code, try one more read to drain any remaining data
         match self.do_read(buf) {
-            Ok(Some(0)) => Ok(None),
+            // Nothing left and the child is gone: EOF.
+            Ok(Some(0)) if child_gone => Ok(None),
+            // Nothing to read right now, but the child is still alive.
+            Ok(Some(0)) => Ok(Some(0)),
             Ok(n) => Ok(n),
-            Err(PtyError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No more data, child is gone
-                Ok(None)
-            }
             Err(e) => Err(e),
         }
     }
@@ -263,6 +262,29 @@ impl Pty for UnixPty {
     /// beginning of a line.
     fn send_eof(&mut self) {
         let _ = unistd::write(&self.master, &[0x04]);
+    }
+
+    /// Resize the pseudo-terminal window (`TIOCSWINSZ`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `TIOCSWINSZ` ioctl fails.
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<(), PtyError> {
+        let ws = nix::libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `master` is an open fd and `ws` outlives the call.
+        let ret = unsafe { nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCSWINSZ, &ws) };
+        if ret == -1 {
+            return Err(PtyError::Resize(format!(
+                "TIOCSWINSZ failed: {}",
+                nix::errno::Errno::last()
+            )));
+        }
+        Ok(())
     }
 
     /// Wait for the child process to exit.
@@ -469,20 +491,52 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_child_exits_on_eof() {
-        let mut pty = UnixPty::spawn("/bin/bash").expect("spawn failed");
+    fn test_pty_resize_succeeds() {
+        let mut pty = UnixPty::new_empty().expect("new_empty failed");
+        assert!(pty.resize(40, 120).is_ok());
+    }
 
-        // Give the shell time to start
+    #[test]
+    fn test_pty_reads_eof_after_child_exits() {
+        // Regression: after the child's output is drained, reads must report EOF
+        // so the session can surface the exit.
+        let mut pty = UnixPty::spawn("/bin/echo").expect("spawn failed");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let mut buf = [0u8; 256];
+        let mut eof = false;
+        for _ in 0..50 {
+            match pty.read(&mut buf) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    eof = true;
+                    break;
+                }
+                Err(e) => panic!("read error: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(eof, "read should report EOF after the child exits");
+    }
+
+    #[test]
+    fn test_pty_child_exits_on_eof() {
+        // Use `cat`, which reliably exits on EOF. (An interactive `bash` may
+        // ignore Ctrl+D depending on the user's `IGNOREEOF` setting, which
+        // would make this test hang on `wait()`.)
+        let mut pty = UnixPty::spawn("/bin/cat").expect("spawn failed");
+
+        // Give the child time to start
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // Send EOF (Ctrl+D)
         pty.send_eof();
 
-        // Wait for the shell to exit
+        // Wait for the child to exit
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let status = pty.wait();
-        // The shell may or may not exit on a single Ctrl+D
         assert!(status.is_ok());
+        assert!(!pty.is_alive());
     }
 }

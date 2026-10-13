@@ -84,6 +84,8 @@ pub struct GpuContext {
     pub surface: Surface<'static>,
     /// Preferred texture format.
     pub preferred_format: wgpu::TextureFormat,
+    /// Preferred composite alpha mode (transparent when the platform supports it).
+    pub preferred_alpha_mode: wgpu::CompositeAlphaMode,
 }
 
 impl GpuContextBase {
@@ -158,6 +160,7 @@ impl GpuContext {
             queue: Arc::clone(&base.queue),
             surface,
             preferred_format,
+            preferred_alpha_mode: wgpu::CompositeAlphaMode::Auto,
         })
     }
 
@@ -176,6 +179,24 @@ impl GpuContext {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(caps.formats[0]);
+
+        // Prefer a straight-alpha (post-multiplied) surface so window opacity
+        // composites correctly; fall back to pre-multiplied, then to whatever
+        // the platform chooses.
+        self.preferred_alpha_mode = if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else {
+            wgpu::CompositeAlphaMode::Auto
+        };
+
         Ok(())
     }
 
@@ -184,7 +205,7 @@ impl GpuContext {
         config.width = config.width.max(1);
         config.height = config.height.max(1);
         config.format = self.preferred_format;
-        config.alpha_mode = wgpu::CompositeAlphaMode::Auto;
+        config.alpha_mode = self.preferred_alpha_mode;
         config.view_formats = vec![];
         config.present_mode = wgpu::PresentMode::AutoVsync;
         self.surface.configure(&self.device, config);

@@ -107,6 +107,43 @@ impl FontHandle {
         self.db.with_face_data(self.face_id, f)
     }
 
+    /// Run a closure with the raw face data of a specific face.
+    ///
+    /// Returns `None` if the face data is unavailable.
+    pub fn with_face_data_for<R>(
+        &self,
+        id: fontdb::ID,
+        f: impl FnOnce(&[u8], u32) -> R,
+    ) -> Option<R> {
+        self.db.with_face_data(id, f)
+    }
+
+    /// Whether the face `id` maps `ch` to a real glyph.
+    fn face_has_glyph(&self, id: fontdb::ID, ch: char) -> bool {
+        self.with_face_data_for(id, |data, index| {
+            swash::FontRef::from_index(data, index as usize)
+                .is_some_and(|font| font.charmap().map(ch) != 0)
+        })
+        .unwrap_or(false)
+    }
+
+    /// Find a face able to render `ch`, preferring the configured face.
+    ///
+    /// Implements per-glyph fallback (CL-5): when the primary face does not
+    /// cover a character (emoji, Nerd Font symbols, …), other installed faces
+    /// are searched, monospaced ones first.
+    pub fn face_for_char(&self, ch: char) -> Option<fontdb::ID> {
+        if self.face_has_glyph(self.face_id, ch) {
+            return Some(self.face_id);
+        }
+        self.db
+            .faces()
+            .filter(|f| f.monospaced)
+            .find(|f| self.face_has_glyph(f.id, ch))
+            .or_else(|| self.db.faces().find(|f| self.face_has_glyph(f.id, ch)))
+            .map(|f| f.id)
+    }
+
     /// Map a character to a glyph id in this font (0 if unmapped).
     pub fn glyph_id(&self, ch: char) -> u16 {
         self.with_face_data(|data, index| {
@@ -245,6 +282,14 @@ mod tests {
         let font = FontHandle::new(&config);
         // 'A' must map to a non-zero glyph id in any usable font.
         assert!(font.glyph_id('A') > 0);
+    }
+
+    #[test]
+    fn test_face_for_char_prefers_primary() {
+        let font = FontHandle::new(&FontConfig::default());
+        // Characters the configured face covers must resolve to that face.
+        assert_eq!(font.face_for_char('A'), Some(font.face_id));
+        assert_eq!(font.face_for_char(' '), Some(font.face_id));
     }
 
     #[test]
