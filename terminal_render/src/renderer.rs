@@ -166,6 +166,10 @@ pub struct RenderContent<'a> {
     pub background_color: Color,
     /// Tab bar to draw above the panes, if any.
     pub tab_bar: Option<TabBarContent<'a>>,
+    /// Gaps between adjacent panes, drawn as a thin divider line (RF-52).
+    pub dividers: &'a [PaneRect],
+    /// Colour of the divider line (RGBA-ordered) (RF-52).
+    pub divider_color: Color,
 }
 
 /// A contiguous range of indices to draw, optionally clipped to a rectangle.
@@ -366,6 +370,20 @@ fn cell_span(cell: &CellContent, cell_w: f32) -> Option<f32> {
         0 => None,
         w if w >= 2 => Some(cell_w * f32::from(w)),
         _ => Some(cell_w),
+    }
+}
+
+/// A thin (1 px) line centred inside a divider gap rectangle (RF-52).
+///
+/// A wider-than-tall gap yields a horizontal line, otherwise a vertical one.
+/// Returns `(x, y, width, height)` in pixels.
+fn divider_line(rect: &PaneRect) -> (f32, f32, f32, f32) {
+    let (x, y) = (rect.x as f32, rect.y as f32);
+    let (w, h) = (rect.width as f32, rect.height as f32);
+    if rect.width >= rect.height {
+        (x, y + (h - 1.0).max(0.0) / 2.0, w, 1.0)
+    } else {
+        (x + (w - 1.0).max(0.0) / 2.0, y, 1.0, h)
     }
 }
 
@@ -801,6 +819,22 @@ impl TerminalRenderer {
             });
         }
 
+        // Divider lines between panes (RF-52), drawn over the panes.
+        if !content.dividers.is_empty() {
+            let first_index = indices.len() as u32;
+            self.push_dividers(
+                content.dividers,
+                content.divider_color,
+                &mut vertices,
+                &mut indices,
+            );
+            batches.push(DrawBatch {
+                first_index,
+                index_count: indices.len() as u32 - first_index,
+                scissor: None,
+            });
+        }
+
         if let Some(bar) = &content.tab_bar {
             let bar_width = content
                 .panes
@@ -993,6 +1027,29 @@ impl TerminalRenderer {
                 solid,
                 unpack_rgba(fg),
             );
+        }
+    }
+
+    /// Push the divider lines between panes (RF-52).
+    fn push_dividers(
+        &self,
+        dividers: &[PaneRect],
+        color: Color,
+        vertices: &mut Vec<QuadVertex>,
+        indices: &mut Vec<u32>,
+    ) {
+        let white = self.atlas.white_region();
+        let uv = white.uv(self.atlas.dimensions());
+        let solid = (
+            (uv.0 + uv.2) * 0.5,
+            (uv.1 + uv.3) * 0.5,
+            (uv.0 + uv.2) * 0.5,
+            (uv.1 + uv.3) * 0.5,
+        );
+        let rgba = unpack_rgba(color);
+        for rect in dividers {
+            let (x, y, w, h) = divider_line(rect);
+            self.push_quad(vertices, indices, x, y, w, h, solid, rgba);
         }
     }
 
@@ -1409,5 +1466,26 @@ mod tests {
             ..CellContent::default()
         };
         assert_eq!(cell_span(&continuation, 12.0), None);
+    }
+
+    #[test]
+    fn test_divider_line_centers_a_thin_line() {
+        // A wide gap yields a horizontal line in its vertical centre.
+        let horizontal = PaneRect {
+            x: 0,
+            y: 20,
+            width: 100,
+            height: 2,
+        };
+        assert_eq!(divider_line(&horizontal), (0.0, 20.5, 100.0, 1.0));
+
+        // A tall gap yields a vertical line in its horizontal centre.
+        let vertical = PaneRect {
+            x: 50,
+            y: 0,
+            width: 2,
+            height: 40,
+        };
+        assert_eq!(divider_line(&vertical), (50.5, 0.0, 1.0, 40.0));
     }
 }

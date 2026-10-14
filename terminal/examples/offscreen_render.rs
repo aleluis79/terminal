@@ -106,6 +106,8 @@ fn main() {
         panes: &panes,
         background_color: pack_rgba(0x10, 0x10, 0x20, 0xFF),
         tab_bar: None,
+        dividers: &[],
+        divider_color: pack_rgba(0x60, 0x60, 0x70, 0xFF),
     };
     let config = wgpu::SurfaceConfiguration {
         width,

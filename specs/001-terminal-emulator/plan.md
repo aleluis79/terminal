@@ -371,3 +371,25 @@ rejilla y píxeles contra una referencia (`pyte`). Este procedimiento fue el que
 localizó CL-13 y sirve para validar RF-44 a RF-51 sin depender de un entorno
 gráfico.
 
+### 5.5. Divisor de paneles (RF-52)
+
+Hoy el hueco entre paneles (`SPLIT_GAP`) queda del color del fondo, sin línea.
+Se añade un divisor visible sin cambiar la geometría del reparto:
+
+| Módulo | Responsabilidad | RF |
+|--------|-----------------|----|
+| `gui::split` | `divider_rects(area, gap)`: rectángulos de los huecos entre hermanos | RF-52 |
+| `render::renderer` | `RenderContent.dividers` + `divider_color`; dibuja cada hueco como un quad sólido | RF-52 |
+| `terminal` | Calcula los divisores de la pestaña activa y los pasa al renderer | RF-52 |
+
+Decisión: dibujar el divisor como una banda **sólida de 1 px centrada en el
+hueco**, no rellenar todo el hueco. Alternativas descartadas: rellenar el hueco
+completo (engorda la separación y mueve el área de cada panel) o dibujar bordes
+de panel (dependería del color de fondo del programa). Color: tomado del tema
+(color de acento/cursor), sin nuevo parámetro de configuración.
+
+Tests: Unit (`gui::split`) de `divider_rects` (1 split → 1 rectángulo en el
+hueco correcto; 2 splits anidados → 2 rectángulos) y verificación visual con
+`render_capture` sobre una captura con paneles divididos.
+
+

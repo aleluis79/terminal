@@ -830,9 +830,22 @@ impl AppInner {
         // Cell buffers are kept alive here; the panes below borrow them.
         let mut pane_cells: Vec<Vec<terminal_render::renderer::CellContent>> = Vec::new();
         let mut pane_specs: Vec<PaneSpec> = Vec::new();
+        // Divider gaps between the panes of the active tab (RF-52).
+        let mut divider_rects: Vec<PaneRect> = Vec::new();
 
         if let Some(tab_state) = self.active_tab_state() {
             let focused = tab_state.layout.focused_panel();
+            divider_rects = tab_state
+                .layout
+                .divider_rects(area, SPLIT_GAP)
+                .into_iter()
+                .map(|r| PaneRect {
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: r.height,
+                })
+                .collect();
             for (id, rect) in tab_state.layout.rects(area, SPLIT_GAP) {
                 let Some(session) = tab_state.panes.get(&id) else {
                     continue;
@@ -901,10 +914,19 @@ impl AppInner {
             })
             .collect();
 
+        // Divider accent colour: the theme's cursor colour, kept subtle with a
+        // little transparency, falling back to a neutral grey (RF-52).
+        let divider_color = parse_palette_color(&self.config.colors.primary.cursor).map_or_else(
+            || pack_rgba(0x60, 0x60, 0x70, 0xFF),
+            |c| (c & 0xFFFF_FF00) | 0x88,
+        );
+
         let content = RenderContent {
             panes: &panes,
             background_color: bg_render,
             tab_bar,
+            dividers: &divider_rects,
+            divider_color,
         };
 
         // Get the surface texture view and render

@@ -333,6 +333,15 @@
   - Regrabar `opencode` por PTY, reinyectarlo en `terminal_core` y renderizarlo offscreen; comparar rejilla contra `pyte`
   - Hecho cuando: la rejilla coincide salvo features fuera de alcance y el frame renderizado no muestra líneas, solapes ni cajas `.notdef`
 
+## Fase 11: Divisor de paneles
+
+- [x] **T063: Dibujar un divisor visible entre paneles (RF-52)**
+  - RF: RF-52
+  - `terminal_gui/src/split.rs`: `divider_rects(area, gap)` con los rectángulos de los huecos
+  - `terminal_render/src/renderer.rs`: campos `dividers`/`divider_color` en `RenderContent` y dibujo de la banda
+  - `terminal/src/main.rs`: pasar los divisores de la pestaña activa
+  - Hecho cuando: con 2+ paneles aparece una línea de 1 px entre ellos; sin splits, ninguna
+
 ## Resumen
 
 | Fase | Tareas | RFs cubiertos |
@@ -348,5 +357,6 @@
 | 8: Advanced | T038-T042 | RF-16, RF-19, RF-20, RF-22, RF-24 |
 | 9: Integration | T043-T045 | Todos |
 | 10: Compatibilidad TUI | T046-T062 | RF-44 a RF-51, CL-9 a CL-14 |
+| 11: Divisor de paneles | T063 | RF-52 |
 
-**Total: 62 tareas**
+**Total: 63 tareas**

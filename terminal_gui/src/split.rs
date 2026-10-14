@@ -461,6 +461,83 @@ impl SplitLayout {
         }
     }
 
+    /// Compute the pixel rectangles of the gaps between adjacent panels.
+    ///
+    /// Each rectangle is the `gap`-wide band between the two children of a
+    /// split, which is where the divider line is drawn (RF-52). The geometry
+    /// matches [`rects`](Self::rects), so a divider always sits exactly in the
+    /// space left between two panels.
+    pub fn divider_rects(&self, area: Rect, gap: u32) -> Vec<Rect> {
+        let mut out = Vec::new();
+        Self::collect_divider_rects(&self.root, area, gap, &mut out);
+        out
+    }
+
+    /// Recursively collect the gap rectangle of every split.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "Layout math on small pixel/ratio values"
+    )]
+    fn collect_divider_rects(node: &SplitNode, area: Rect, gap: u32, out: &mut Vec<Rect>) {
+        let SplitNode::Split {
+            direction,
+            left,
+            right,
+            ratio,
+        } = node
+        else {
+            return;
+        };
+        let ratio = ratio.clamp(0.1, 0.9);
+        match direction {
+            SplitDirection::Horizontal => {
+                // Panels stacked vertically: the gap is a horizontal band.
+                let first = ((area.height as f32 * ratio) as u32).max(1);
+                let gap = gap.min(area.height.saturating_sub(first));
+                out.push(Rect {
+                    x: area.x,
+                    y: area.y + first,
+                    width: area.width,
+                    height: gap,
+                });
+                let top = Rect {
+                    height: first,
+                    ..area
+                };
+                let bottom = Rect {
+                    y: area.y + first + gap,
+                    height: area.height.saturating_sub(first + gap),
+                    ..area
+                };
+                Self::collect_divider_rects(left, top, gap, out);
+                Self::collect_divider_rects(right, bottom, gap, out);
+            }
+            SplitDirection::Vertical => {
+                // Panels side by side: the gap is a vertical band.
+                let first = ((area.width as f32 * ratio) as u32).max(1);
+                let gap = gap.min(area.width.saturating_sub(first));
+                out.push(Rect {
+                    x: area.x + first,
+                    y: area.y,
+                    width: gap,
+                    height: area.height,
+                });
+                let left_area = Rect {
+                    width: first,
+                    ..area
+                };
+                let right_area = Rect {
+                    x: area.x + first + gap,
+                    width: area.width.saturating_sub(first + gap),
+                    ..area
+                };
+                Self::collect_divider_rects(left, left_area, gap, out);
+                Self::collect_divider_rects(right, right_area, gap, out);
+            }
+        }
+    }
+
     /// Split the focused panel horizontally.
     ///
     /// Returns the ID of the newly created panel.
@@ -1014,6 +1091,102 @@ mod tests {
                 height: 18
             }
         );
+    }
+
+    #[test]
+    fn test_divider_rects_vertical_sits_in_the_gap() {
+        let mut layout = SplitLayout::new();
+        layout.split_vertical(0.5);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let dividers = layout.divider_rects(area, 2);
+        assert_eq!(dividers.len(), 1);
+        // A vertical split leaves a vertical band between the two panels.
+        assert_eq!(
+            dividers[0],
+            Rect {
+                x: 50,
+                y: 0,
+                width: 2,
+                height: 40
+            }
+        );
+    }
+
+    #[test]
+    fn test_divider_rects_horizontal_sits_in_the_gap() {
+        let mut layout = SplitLayout::new();
+        layout.split_horizontal(0.5);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let dividers = layout.divider_rects(area, 2);
+        assert_eq!(dividers.len(), 1);
+        assert_eq!(
+            dividers[0],
+            Rect {
+                x: 0,
+                y: 20,
+                width: 100,
+                height: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_divider_rects_nested() {
+        let mut layout = SplitLayout::new();
+        layout.split_vertical(0.5);
+        layout.split_horizontal(0.5); // splits the right (focused) panel
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        // One vertical band plus one horizontal band inside the right half.
+        let dividers = layout.divider_rects(area, 2);
+        assert_eq!(dividers.len(), 2);
+        assert_eq!(
+            dividers[0],
+            Rect {
+                x: 50,
+                y: 0,
+                width: 2,
+                height: 40
+            }
+        );
+        assert_eq!(
+            dividers[1],
+            Rect {
+                x: 52,
+                y: 20,
+                width: 48,
+                height: 2
+            }
+        );
+    }
+
+    #[test]
+    fn test_divider_rects_single_panel_is_empty() {
+        let layout = SplitLayout::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        assert!(layout.divider_rects(area, 2).is_empty());
     }
 
     #[test]

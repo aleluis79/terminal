@@ -82,6 +82,10 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - RF-50: DONDE el programa guarda el cursor (`ESC[s`), ENTONCES EL SISTEMA recuerda su posición y forma; DONDE lo restaura (`ESC[u`), ENTONCES EL SISTEMA vuelve a esa posición.
 - RF-51: DONDE el programa consulta la posición del cursor (`ESC[6n`), EL SISTEMA responde `ESC[<fila>;<columna>R`; DONDE consulta los colores activos (OSC 10/11/12 con `?`), EL SISTEMA responde el color correspondiente; DONDE consulta los atributos del dispositivo (`ESC[c`), EL SISTEMA responde una identificación de terminal VT/xterm.
 
+### Paneles
+
+- RF-52: DONDE una pestaña tiene más de un panel, EL SISTEMA dibuja una línea divisoria visible en el hueco entre paneles adyacentes, con el color de acento del tema.
+
 ## Requisitos no funcionales
 - Rendimiento: renderizado a 60 FPS con 10000 líneas de texto visibles.
 - Memoria: uso inferior a 100 MB en carga normal (50000 líneas de scrollback).
@@ -116,7 +120,7 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - Clipboard nativo (sin modifiers) ni drag-and-drop de archivos.
 
 ## Criterios de finalización
-- Todos los RF (1–51) tienen al menos un test automatizado o verificación manual documentada.
+- Todos los RF (1–52) tienen al menos un test automatizado o verificación manual documentada.
 - `cargo test` pasa en Linux y Windows.
 - Demo manual: abrir, crear pestañas, dividir paneles, copiar/pegar, cambiar configuración, y ejecutar `neofetch` o `htop` correctamente.
 
