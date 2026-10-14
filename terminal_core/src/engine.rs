@@ -4,7 +4,7 @@
 //! and reading the resulting screen state.
 
 use crate::buffer::GridBuffer;
-use crate::cell::{Cell, CellStyle};
+use crate::cell::{char_width, Cell, CellStyle};
 use crate::parser::{Action, Parser};
 use crate::state::TerminalState;
 
@@ -163,6 +163,23 @@ impl TerminalEngine {
             Action::SetCursorShape(shape) => {
                 self.state.cursor.shape = shape;
             }
+            Action::SetCursorBlink(blink) => {
+                self.state.cursor.blink = blink;
+            }
+            Action::SetCursorVisible(visible) => {
+                self.state.cursor.visible = visible;
+            }
+            Action::SetSynchronizedOutput(enabled) => {
+                self.state.modes.decset(2026, enabled);
+            }
+            Action::SaveCursor => {
+                self.state.save_cursor();
+            }
+            Action::RestoreCursor => {
+                self.state.restore_cursor();
+                self.wrap_pending = false;
+                self.sync_cursor_to_buffer();
+            }
             Action::QueryForegroundColor => {
                 // Query — pass to GUI to respond
                 gui_actions.push(Action::QueryForegroundColor);
@@ -174,6 +191,14 @@ impl TerminalEngine {
             Action::QueryTextColor => {
                 // Query — pass to GUI to respond
                 gui_actions.push(Action::QueryTextColor);
+            }
+            Action::QueryCursorPosition => {
+                // Query — pass to GUI to respond (RF-51)
+                gui_actions.push(Action::QueryCursorPosition);
+            }
+            Action::QueryDeviceAttributes => {
+                // Query — pass to GUI to respond (RF-51)
+                gui_actions.push(Action::QueryDeviceAttributes);
             }
             Action::SetForegroundColorFromOsc(color) => {
                 // Color set from OSC 10 — pass to GUI for application
@@ -220,29 +245,34 @@ impl TerminalEngine {
     }
 
     /// Write a character at the current cursor position.
+    ///
+    /// Character width is taken from Unicode (RF-44): wide characters occupy
+    /// two cells, zero-width characters (combining marks) occupy none. A wide
+    /// character that does not fit in the last column wraps to the next line
+    /// *before* being written, so it is never split across two rows (CL-9).
     fn write_char(&mut self, c: char) {
-        let cols = self.buffer.active().grid.cols;
-        let rows = self.buffer.active().grid.rows;
+        let width = char_width(c);
+        if width == 0 {
+            // Combining marks and other zero-width characters have no cell of
+            // their own; they must not move the cursor (CL-11).
+            return;
+        }
 
         // Deferred wrap (DECAWM): writing the last column does not move to the
         // next row by itself; the wrap happens when the next character is
         // written. Without this, a line exactly `cols` wide consumes two rows.
         if self.wrap_pending {
-            self.wrap_pending = false;
-            self.state.cursor.col = 0;
-            self.state.cursor.row += 1;
-            if self.state.cursor.row >= rows {
-                if self.buffer.is_alternate_screen_active() {
-                    self.buffer.alternate_line_feed();
-                } else {
-                    self.buffer.main_line_feed();
-                }
-                self.state.cursor.row = self.buffer.active().cursor().0;
-            }
+            self.wrap_to_next_line();
+        }
+
+        // A wide character needs two columns: if only one is left, wrap first.
+        if width == 2 && self.state.cursor.col + 1 >= self.buffer.active().grid.cols {
+            self.wrap_to_next_line();
         }
 
         let row = self.state.cursor.row;
         let col = self.state.cursor.col;
+        let cols = self.buffer.active().grid.cols;
         let style = CellStyle {
             fg: self.state.fg_color,
             bg: self.state.bg_color,
@@ -255,13 +285,37 @@ impl TerminalEngine {
         };
 
         let buf = self.buffer.active_mut();
-        buf.grid.set(row, col, Cell { c, style });
+        if width == 2 {
+            buf.grid.set_wide(row, col, Cell { c, style, width: 2 });
+        } else {
+            // A narrow character written over either half of a wide glyph must
+            // erase the whole glyph first (CL-10).
+            buf.grid.clear_cell(row, col);
+            buf.grid.set(row, col, Cell { c, style, width: 1 });
+        }
 
         // Advance the column, or arm the deferred wrap at the last column.
-        if self.state.cursor.col + 1 >= cols {
+        if col + width >= cols {
             self.wrap_pending = true;
         } else {
-            self.state.cursor.col += 1;
+            self.state.cursor.col = col + width;
+        }
+    }
+
+    /// Move to the first column of the next line, scrolling if already at the
+    /// bottom of the screen.
+    fn wrap_to_next_line(&mut self) {
+        let rows = self.buffer.active().grid.rows;
+        self.wrap_pending = false;
+        self.state.cursor.col = 0;
+        self.state.cursor.row += 1;
+        if self.state.cursor.row >= rows {
+            if self.buffer.is_alternate_screen_active() {
+                self.buffer.alternate_line_feed();
+            } else {
+                self.buffer.main_line_feed();
+            }
+            self.state.cursor.row = self.buffer.active().cursor().0;
         }
     }
 
@@ -885,5 +939,115 @@ mod tests {
         // Writing continues at the preserved cursor position.
         engine.input(b"!");
         assert_eq!(engine.buffer().active().grid.get(0, 5).c, '!');
+    }
+
+    #[test]
+    fn test_wide_characters_occupy_two_cells() {
+        let mut engine = TerminalEngine::new(4, 10);
+        engine.input("日本".as_bytes());
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, '日');
+        assert_eq!(buf.grid.get(0, 0).width, 2);
+        assert!(buf.grid.is_continuation(0, 1));
+        assert_eq!(buf.grid.get(0, 2).c, '本');
+        assert!(buf.grid.is_continuation(0, 3));
+        assert_eq!(engine.state().cursor.col, 4);
+        assert_eq!(engine.state().cursor.row, 0);
+    }
+
+    #[test]
+    fn test_wide_character_wraps_whole_at_last_column() {
+        // A wide character that does not fit in the last column wraps to the
+        // next line instead of being split (CL-9).
+        let mut engine = TerminalEngine::new(4, 4);
+        engine.input(b"abc");
+        engine.input("日".as_bytes());
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 2).c, 'c');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(buf.grid.get(1, 0).c, '日');
+        assert!(buf.grid.is_continuation(1, 1));
+        assert_eq!(engine.state().cursor.row, 1);
+        assert_eq!(engine.state().cursor.col, 2);
+    }
+
+    #[test]
+    fn test_emoji_is_wide() {
+        let mut engine = TerminalEngine::new(2, 10);
+        engine.input("🦀".as_bytes());
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, '🦀');
+        assert_eq!(buf.grid.get(0, 0).width, 2);
+        assert!(buf.grid.is_continuation(0, 1));
+    }
+
+    #[test]
+    fn test_combining_mark_does_not_advance() {
+        // A combining mark with no base character is ignored and must not move
+        // the cursor (CL-11).
+        let mut engine = TerminalEngine::new(2, 10);
+        engine.input(b"e");
+        engine.input("\u{0301}".as_bytes());
+        assert_eq!(engine.state().cursor.col, 1);
+        assert_eq!(engine.buffer().active().grid.get(0, 1).c, ' ');
+    }
+
+    #[test]
+    fn test_narrow_over_wide_half_clears_both() {
+        // Writing a narrow character over the continuation half of a wide glyph
+        // erases the whole glyph (CL-10).
+        let mut engine = TerminalEngine::new(2, 10);
+        engine.input("日本".as_bytes());
+        engine.input(b"\x1b[4G"); // column 3 (0-indexed): the tail of 本
+        engine.input(b"x");
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 0).c, '日');
+        assert!(buf.grid.is_continuation(0, 1));
+        assert_eq!(buf.grid.get(0, 2).c, ' ');
+        assert_eq!(buf.grid.get(0, 3).c, 'x');
+    }
+
+    #[test]
+    fn test_cursor_visibility_actions() {
+        let mut engine = TerminalEngine::new(2, 10);
+        assert!(engine.state().cursor.visible);
+        engine.input(b"\x1b[?25l");
+        assert!(!engine.state().cursor.visible);
+        engine.input(b"\x1b[?25h");
+        assert!(engine.state().cursor.visible);
+    }
+
+    #[test]
+    fn test_synchronized_output_actions() {
+        let mut engine = TerminalEngine::new(2, 10);
+        assert!(!engine.state().modes.synchronized_output);
+        engine.input(b"\x1b[?2026h");
+        assert!(engine.state().modes.synchronized_output);
+        engine.input(b"\x1b[?2026l");
+        assert!(!engine.state().modes.synchronized_output);
+    }
+
+    #[test]
+    fn test_save_and_restore_cursor_round_trip() {
+        let mut engine = TerminalEngine::new(5, 20);
+        engine.input(b"\x1b[3;5H"); // row 2, col 4
+        engine.input(b"\x1b[s"); // save
+        engine.input(b"\x1b[1;1H"); // move away
+        engine.input(b"\x1b[u"); // restore
+        assert_eq!(engine.state().cursor.row, 2);
+        assert_eq!(engine.state().cursor.col, 4);
+    }
+
+    #[test]
+    fn test_query_actions_reach_the_gui() {
+        let mut engine = TerminalEngine::new(5, 20);
+        engine.input(b"\x1b[3;5H");
+        let actions = engine.input(b"\x1b[6n");
+        assert!(actions.contains(&Action::QueryCursorPosition));
+        let actions = engine.input(b"\x1b[c");
+        assert!(actions.contains(&Action::QueryDeviceAttributes));
     }
 }

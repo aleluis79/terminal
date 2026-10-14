@@ -15,7 +15,7 @@ pub enum CursorShape {
 }
 
 /// Cursor position in the grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
     /// Row position (0-indexed).
     pub row: usize,
@@ -23,6 +23,22 @@ pub struct Cursor {
     pub col: usize,
     /// Cursor shape.
     pub shape: CursorShape,
+    /// Whether the cursor is drawn (DECTCEM, `ESC [ ? 25`).
+    pub visible: bool,
+    /// Whether the cursor blinks (DECSCUSR).
+    pub blink: bool,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            row: 0,
+            col: 0,
+            shape: CursorShape::default(),
+            visible: true,
+            blink: true,
+        }
+    }
 }
 
 impl Cursor {
@@ -31,7 +47,7 @@ impl Cursor {
         Self {
             row,
             col,
-            shape: CursorShape::default(),
+            ..Self::default()
         }
     }
 
@@ -76,6 +92,9 @@ pub struct TerminalModes {
     pub alternate_screen: bool,
     /// Bracketed paste mode.
     pub bracketed_paste: bool,
+    /// Synchronized output (`ESC [ ? 2026`): the terminal must not present the
+    /// frame until the mode is reset (RF-47).
+    pub synchronized_output: bool,
 }
 
 impl Default for TerminalModes {
@@ -86,6 +105,7 @@ impl Default for TerminalModes {
             origin: false,
             alternate_screen: false,
             bracketed_paste: false,
+            synchronized_output: false,
         }
     }
 }
@@ -96,6 +116,7 @@ impl TerminalModes {
         match mode {
             4 => self.insert = enable,
             20 => self.bracketed_paste = enable,
+            2026 => self.synchronized_output = enable,
             _ => {}
         }
         // Common modes
@@ -117,6 +138,7 @@ impl TerminalModes {
             7 => self.wraparound,
             20 => self.bracketed_paste,
             47 | 1047 | 1049 => self.alternate_screen,
+            2026 => self.synchronized_output,
             _ => false,
         }
     }
@@ -164,6 +186,24 @@ impl TextAttributes {
     }
 }
 
+/// A snapshot of the cursor and attributes, saved by SCP (`ESC [ s`) and
+/// restored by RCP (`ESC [ u`) (RF-50).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedCursor {
+    /// Cursor row at save time.
+    pub row: usize,
+    /// Cursor column at save time.
+    pub col: usize,
+    /// Cursor shape at save time.
+    pub shape: CursorShape,
+    /// Text attributes at save time.
+    pub attributes: TextAttributes,
+    /// Foreground colour at save time.
+    pub fg: Color,
+    /// Background colour at save time.
+    pub bg: Color,
+}
+
 /// Complete terminal state.
 #[derive(Debug, Clone)]
 pub struct TerminalState {
@@ -181,6 +221,8 @@ pub struct TerminalState {
     pub default_fg: Color,
     /// Default background color.
     pub default_bg: Color,
+    /// Cursor and attributes saved with SCP (`ESC [ s`).
+    pub saved_cursor: Option<SavedCursor>,
 }
 
 impl Default for TerminalState {
@@ -193,6 +235,7 @@ impl Default for TerminalState {
             bg_color: Color::Named(0),
             default_fg: Color::Named(7),
             default_bg: Color::Named(0),
+            saved_cursor: None,
         }
     }
 }
@@ -211,6 +254,32 @@ impl TerminalState {
         self.attributes = TextAttributes::default();
         self.fg_color = self.default_fg;
         self.bg_color = self.default_bg;
+    }
+
+    /// Save the cursor position, shape, attributes and colours (SCP).
+    pub fn save_cursor(&mut self) {
+        self.saved_cursor = Some(SavedCursor {
+            row: self.cursor.row,
+            col: self.cursor.col,
+            shape: self.cursor.shape,
+            attributes: self.attributes,
+            fg: self.fg_color,
+            bg: self.bg_color,
+        });
+    }
+
+    /// Restore the state saved by [`save_cursor`](Self::save_cursor) (RCP).
+    ///
+    /// Does nothing when nothing has been saved, matching xterm.
+    pub fn restore_cursor(&mut self) {
+        if let Some(saved) = self.saved_cursor {
+            self.cursor.row = saved.row;
+            self.cursor.col = saved.col;
+            self.cursor.shape = saved.shape;
+            self.attributes = saved.attributes;
+            self.fg_color = saved.fg;
+            self.bg_color = saved.bg;
+        }
     }
 
     /// Move cursor to cell and write character.
@@ -256,6 +325,54 @@ mod tests {
         cursor.move_to(10, 20);
         assert_eq!(cursor.row, 10);
         assert_eq!(cursor.col, 20);
+    }
+
+    #[test]
+    fn test_cursor_defaults_to_visible_and_blinking() {
+        let cursor = Cursor::default();
+        assert!(cursor.visible);
+        assert!(cursor.blink);
+    }
+
+    #[test]
+    fn test_modes_synchronized_output() {
+        let mut modes = TerminalModes::default();
+        assert!(!modes.synchronized_output);
+        modes.decset(2026, true);
+        assert!(modes.is_set(2026));
+        modes.decset(2026, false);
+        assert!(!modes.is_set(2026));
+    }
+
+    #[test]
+    fn test_save_and_restore_cursor() {
+        let mut state = TerminalState::default();
+        state.cursor.move_to(3, 7);
+        state.cursor.shape = CursorShape::Beam;
+        state.attributes.bold = true;
+        state.fg_color = Color::Named(4);
+        state.save_cursor();
+
+        state.cursor.move_to(9, 1);
+        state.cursor.shape = CursorShape::Block;
+        state.attributes.bold = false;
+        state.fg_color = Color::Named(1);
+
+        state.restore_cursor();
+        assert_eq!(state.cursor.row, 3);
+        assert_eq!(state.cursor.col, 7);
+        assert_eq!(state.cursor.shape, CursorShape::Beam);
+        assert!(state.attributes.bold);
+        assert_eq!(state.fg_color, Color::Named(4));
+    }
+
+    #[test]
+    fn test_restore_without_save_is_a_noop() {
+        let mut state = TerminalState::default();
+        state.cursor.move_to(2, 2);
+        state.restore_cursor();
+        assert_eq!(state.cursor.row, 2);
+        assert_eq!(state.cursor.col, 2);
     }
 
     #[test]

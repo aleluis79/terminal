@@ -21,6 +21,7 @@ use terminal_config::config::{ColorScheme, Config};
 use terminal_config::loader;
 
 use terminal_core::engine::TerminalEngine;
+use terminal_core::parser::Action;
 use terminal_core::session::{PollResult, TerminalSession};
 use terminal_core::state::CursorShape as EngineCursorShape;
 
@@ -43,6 +44,43 @@ use terminal_gui::window::{GpuContext, GpuContextBase};
 
 /// Pixel gap left between split panes.
 const SPLIT_GAP: u32 = 2;
+
+/// Maximum time a synchronized-output window may hold the frame before it is
+/// presented anyway, so a program that never sends `ESC [ ? 2026 l` cannot
+/// freeze the window (RF-47, CL-12).
+const SYNC_TIMEOUT_MS: u64 = 100;
+
+/// Build the bytes that answer the terminal queries a program made (RF-51).
+///
+/// `cursor` is the 0-indexed position; DSR reports it 1-indexed. Colour queries
+/// answer with the configured theme colour as `#rrggbb`.
+fn query_responses(actions: &[Action], cursor: (usize, usize), fg: &str, bg: &str) -> Vec<u8> {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for action in actions {
+        match action {
+            Action::QueryCursorPosition => {
+                let _ = write!(out, "\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1);
+            }
+            Action::QueryDeviceAttributes => {
+                // DA1: VT220 with ANSI colour.
+                out.push_str("\x1b[?62;22c");
+            }
+            Action::QueryForegroundColor => {
+                let _ = write!(out, "\x1b]10;{fg}\x07");
+            }
+            Action::QueryBackgroundColor => {
+                let _ = write!(out, "\x1b]11;{bg}\x07");
+            }
+            Action::QueryTextColor => {
+                let _ = write!(out, "\x1b]12;{fg}\x07");
+            }
+            _ => {}
+        }
+    }
+    out.into_bytes()
+}
 
 /// Shared application state for the event loop.
 pub struct AppState {
@@ -143,6 +181,8 @@ struct AppInner {
     palette: TerminalPalette,
     /// Last known cursor position (for mouse button events).
     last_mouse_position: (f64, f64),
+    /// Deadline for the current synchronized-output window (RF-47, CL-12).
+    sync_deadline: Option<std::time::Instant>,
 }
 
 impl AppInner {
@@ -186,6 +226,7 @@ impl AppInner {
             needs_redraw: true,
             palette: TerminalPalette::default(),
             last_mouse_position: (0.0, 0.0),
+            sync_deadline: None,
             app_state: None,
         }
     }
@@ -231,6 +272,12 @@ impl AppInner {
     /// Get the engine from the active session.
     fn engine(&self) -> Option<&TerminalEngine> {
         self.active_session().map(TerminalSession::engine)
+    }
+
+    /// Whether the focused program is inside a synchronized update (RF-47).
+    fn synchronized_output_active(&self) -> bool {
+        self.engine()
+            .is_some_and(|engine| engine.state().modes.synchronized_output)
     }
 
     /// Terminal area in pixels (below the tab bar).
@@ -359,6 +406,8 @@ impl AppInner {
     /// Returns `true` when no tabs remain (the app should exit).
     fn poll_sessions(&mut self) -> bool {
         let mut exited: Vec<(TabId, PanelId)> = Vec::new();
+        let fg = self.config.colors.primary.foreground.clone();
+        let bg = self.config.colors.primary.background.clone();
 
         for (tab_id, state) in &mut self.tabs {
             for (panel_id, session) in &mut state.panes {
@@ -375,6 +424,18 @@ impl AppInner {
                             tracing::error!("PTY error: {e}");
                             break;
                         }
+                    }
+                }
+
+                // Answer any query the program sent (RF-51). The response is
+                // written back to the PTY, which doubles as this terminal's
+                // "stdin" for the child.
+                let actions = session.take_gui_actions();
+                if !actions.is_empty() {
+                    let cursor = session.engine().state().cursor;
+                    let response = query_responses(&actions, (cursor.row, cursor.col), &fg, &bg);
+                    if !response.is_empty() {
+                        let _ = session.write_to_shell(&response);
                     }
                 }
             }
@@ -668,8 +729,12 @@ impl AppInner {
 
     /// Update cursor visibility (blink effect).
     fn update_cursor(&mut self, delta_ms: u64) {
-        // A zero interval means a steady (non-blinking) cursor.
-        if self.cursor_blink_interval == 0 {
+        // A zero interval, or a program that disabled blinking (DECSCUSR),
+        // means a steady cursor (RF-48, RF-49).
+        let blinking = self
+            .engine()
+            .is_none_or(|engine| engine.state().cursor.blink);
+        if self.cursor_blink_interval == 0 || !blinking {
             self.cursor_visible = true;
             return;
         }
@@ -696,6 +761,21 @@ impl AppInner {
 
         if self.renderer.is_none() {
             return;
+        }
+
+        // RF-47 / CL-12: while the focused program is inside a synchronized
+        // update (`ESC [ ? 2026 h` … `l`), hold the frame so no intermediate
+        // state is shown. The hold is bounded by `SYNC_TIMEOUT_MS` so a program
+        // that dies without sending the closing `l` cannot freeze the window.
+        if self.synchronized_output_active() {
+            let deadline = *self.sync_deadline.get_or_insert_with(|| {
+                std::time::Instant::now() + std::time::Duration::from_millis(SYNC_TIMEOUT_MS)
+            });
+            if std::time::Instant::now() < deadline {
+                return;
+            }
+        } else {
+            self.sync_deadline = None;
         }
 
         // Background color from config (RGBA-ordered for the renderer).
@@ -768,6 +848,7 @@ impl AppInner {
                             terminal_render::renderer::CellContent {
                                 ch: cell.c,
                                 style: cell.style,
+                                width: cell.width,
                             }
                         })
                     })
@@ -785,7 +866,7 @@ impl AppInner {
                     cursor_shape,
                     cursor_row: st.cursor.row,
                     cursor_col: st.cursor.col,
-                    cursor_visible: id == focused && self.cursor_visible,
+                    cursor_visible: id == focused && self.cursor_visible && st.cursor.visible,
                     cols: buf.grid.cols,
                     selection: if selection_pane == Some(id) {
                         Selection {

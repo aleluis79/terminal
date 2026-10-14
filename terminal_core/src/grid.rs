@@ -63,6 +63,83 @@ impl Grid {
     pub fn is_empty(&self) -> bool {
         self.rows == 0 || self.cols == 0
     }
+
+    /// Whether the cell at (row, col) is the right half (continuation) of a
+    /// wide character.
+    pub fn is_continuation(&self, row: usize, col: usize) -> bool {
+        self.get_ref(row, col).width == 0
+    }
+
+    /// Write a wide character at (row, col), marking `col + 1` as its
+    /// continuation.
+    ///
+    /// Any pre-existing wide character overlapping either cell is cleared
+    /// first, so a wide glyph never leaves an orphaned half behind. A wide
+    /// character that would not fit in the last column is written as a narrow
+    /// cell instead (the caller is expected to wrap beforehand).
+    pub fn set_wide(&mut self, row: usize, col: usize, cell: Cell) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        self.clear_cell(row, col);
+        if col + 1 >= self.cols {
+            let mut narrow = cell;
+            narrow.width = 1;
+            self.set(row, col, narrow);
+            return;
+        }
+        self.clear_cell(row, col + 1);
+
+        let header = Cell { width: 2, ..cell };
+        let mut tail = cell;
+        tail.c = ' ';
+        tail.width = 0;
+        self.set(row, col, header);
+        self.set(row, col + 1, tail);
+    }
+
+    /// Clear the cell at (row, col), also clearing the other half when the
+    /// cell belongs to a wide character.
+    pub fn clear_cell(&mut self, row: usize, col: usize) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        let width = self.cells[row * self.cols + col].width;
+        self.cells[row * self.cols + col] = Cell::default();
+        match width {
+            // The cleared cell was the left half: clear its continuation.
+            2 if col + 1 < self.cols => {
+                self.cells[row * self.cols + col + 1] = Cell::default();
+            }
+            // The cleared cell was the right half: clear its header.
+            0 if col > 0 => {
+                self.cells[row * self.cols + col - 1] = Cell::default();
+            }
+            _ => {}
+        }
+    }
+
+    /// Clear any wide-character half left without its partner (RF-45, CL-4).
+    ///
+    /// After an operation that can truncate a row (resize, reflow) a wide glyph
+    /// may keep only one of its two cells. Such orphans are blanked so the grid
+    /// always holds whole pairs.
+    pub fn sanitize_wide(&mut self) {
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let idx = row * self.cols + col;
+                match self.cells[idx].width {
+                    2 if col + 1 >= self.cols || self.cells[idx + 1].width != 0 => {
+                        self.cells[idx] = Cell::default();
+                    }
+                    0 if col == 0 || self.cells[idx - 1].width != 2 => {
+                        self.cells[idx] = Cell::default();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -87,6 +164,7 @@ mod tests {
                 fg: Color::Named(1),
                 ..CellStyle::default()
             },
+            width: 1,
         };
         grid.set(5, 5, cell);
         assert_eq!(grid.get(5, 5).c, 'A');
@@ -177,5 +255,95 @@ mod tests {
         }
         assert_eq!(new_grid.get(5, 5).c, 'A');
         assert_eq!(new_grid.get(15, 15).c, ' '); // new area is empty
+    }
+
+    #[test]
+    fn test_set_wide_marks_continuation() {
+        let mut grid = Grid::new(2, 5);
+        grid.set_wide(
+            0,
+            1,
+            Cell {
+                c: '日',
+                ..Cell::default()
+            },
+        );
+
+        assert_eq!(grid.get(0, 1).c, '日');
+        assert_eq!(grid.get(0, 1).width, 2);
+        assert!(grid.is_continuation(0, 2));
+        assert_eq!(grid.get(0, 2).width, 0);
+    }
+
+    #[test]
+    fn test_clear_cell_clears_both_halves() {
+        let mut grid = Grid::new(2, 5);
+        grid.set_wide(
+            0,
+            1,
+            Cell {
+                c: '本',
+                ..Cell::default()
+            },
+        );
+
+        // Clearing either half must clear the other one too.
+        grid.clear_cell(0, 2);
+        assert_eq!(grid.get(0, 1).c, ' ');
+        assert_eq!(grid.get(0, 2).c, ' ');
+        assert_eq!(grid.get(0, 1).width, 1);
+        assert_eq!(grid.get(0, 2).width, 1);
+
+        grid.set_wide(
+            0,
+            1,
+            Cell {
+                c: '本',
+                ..Cell::default()
+            },
+        );
+        grid.clear_cell(0, 1);
+        assert_eq!(grid.get(0, 2).c, ' ');
+    }
+
+    #[test]
+    fn test_set_wide_over_narrow_clears_previous_pairs() {
+        let mut grid = Grid::new(2, 5);
+        grid.set(
+            0,
+            0,
+            Cell {
+                c: 'A',
+                ..Cell::default()
+            },
+        );
+        // Overwrite starting on the neighbour of a previous wide glyph.
+        grid.set_wide(
+            0,
+            0,
+            Cell {
+                c: '日',
+                ..Cell::default()
+            },
+        );
+        assert_eq!(grid.get(0, 0).c, '日');
+        assert!(grid.is_continuation(0, 1));
+        // The old narrow cell at column 1 is gone.
+        assert_ne!(grid.get(0, 1).c, 'A');
+    }
+
+    #[test]
+    fn test_set_wide_in_last_column_stays_narrow() {
+        let mut grid = Grid::new(1, 4);
+        grid.set_wide(
+            0,
+            3,
+            Cell {
+                c: '日',
+                ..Cell::default()
+            },
+        );
+        assert_eq!(grid.get(0, 3).c, '日');
+        assert_eq!(grid.get(0, 3).width, 1);
     }
 }

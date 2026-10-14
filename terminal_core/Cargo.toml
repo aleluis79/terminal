@@ -8,6 +8,10 @@ license = "MIT"
 [lints]
 workspace = true
 
+[dependencies]
+# Character display width (Unicode East Asian Width + zero-width combining marks).
+unicode-width = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 terminal_pty = { path = "../terminal_pty" }
 

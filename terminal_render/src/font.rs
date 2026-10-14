@@ -168,21 +168,36 @@ impl FontHandle {
         .unwrap_or(false)
     }
 
+    /// Faces to try for a glyph, in priority order (RF-46): the configured
+    /// family first, then the other monospaced faces, then every remaining
+    /// face (symbol and emoji fonts live here).
+    pub fn fallback_chain(&self) -> Vec<fontdb::ID> {
+        let mut chain = Vec::new();
+        chain.push(self.face_id);
+        for face in self.db.faces() {
+            if face.id != self.face_id && face.monospaced {
+                chain.push(face.id);
+            }
+        }
+        for face in self.db.faces() {
+            if face.id != self.face_id && !face.monospaced {
+                chain.push(face.id);
+            }
+        }
+        chain
+    }
+
     /// Find a face able to render `ch`, preferring the configured face.
     ///
-    /// Implements per-glyph fallback (CL-5): when the primary face does not
-    /// cover a character (emoji, Nerd Font symbols, …), other installed faces
-    /// are searched, monospaced ones first.
+    /// Implements per-glyph fallback (CL-5, RF-46): when the primary face does
+    /// not cover a character (emoji, Nerd Font symbols, …), fonts are searched
+    /// in [`Self::fallback_chain`] order. Returns `None` only when no installed
+    /// face has the glyph, so the caller draws `.notdef` as a last resort
+    /// (CL-14) instead of a face that would render the wrong thing.
     pub fn face_for_char(&self, ch: char) -> Option<fontdb::ID> {
-        if self.face_has_glyph(self.face_id, ch) {
-            return Some(self.face_id);
-        }
-        self.db
-            .faces()
-            .filter(|f| f.monospaced)
-            .find(|f| self.face_has_glyph(f.id, ch))
-            .or_else(|| self.db.faces().find(|f| self.face_has_glyph(f.id, ch)))
-            .map(|f| f.id)
+        self.fallback_chain()
+            .into_iter()
+            .find(|&id| self.face_has_glyph(id, ch))
     }
 
     /// Map a character to a glyph id in this font (0 if unmapped).
@@ -331,6 +346,33 @@ mod tests {
         // Characters the configured face covers must resolve to that face.
         assert_eq!(font.face_for_char('A'), Some(font.face_id));
         assert_eq!(font.face_for_char(' '), Some(font.face_id));
+    }
+
+    #[test]
+    fn test_fallback_chain_starts_with_the_configured_face() {
+        let font = FontHandle::new(&FontConfig::default());
+        let chain = font.fallback_chain();
+        assert_eq!(chain.first(), Some(&font.face_id));
+        // No face is offered twice.
+        let mut sorted = chain.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), chain.len());
+    }
+
+    #[test]
+    fn test_face_for_char_never_returns_a_face_without_the_glyph() {
+        // RF-46 / CL-14: fallback either finds a face that really has the glyph
+        // or reports `None` (the caller may then draw `.notdef`).
+        let font = FontHandle::new(&FontConfig::default());
+        for ch in ['A', '─', '🦀', '\u{1F3FB}', '\u{10FFFD}'] {
+            if let Some(id) = font.face_for_char(ch) {
+                assert!(
+                    font.face_has_glyph(id, ch),
+                    "face_for_char({ch:?}) returned a face without the glyph"
+                );
+            }
+        }
     }
 
     #[test]

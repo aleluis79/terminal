@@ -83,6 +83,20 @@ pub struct CellContent {
     pub ch: char,
     /// Colours and text attributes for the cell.
     pub style: CellStyle,
+    /// Display width of the cell (RF-44): `2` for the left half of a wide
+    /// character, `1` for an ordinary cell, `0` for the right half
+    /// (continuation) of a wide character, which is not drawn on its own.
+    pub width: u8,
+}
+
+impl Default for CellContent {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            style: CellStyle::default(),
+            width: 1,
+        }
+    }
 }
 
 /// A tab label drawn in the tab bar.
@@ -340,6 +354,19 @@ fn fit_tiling_glyph(
     }
 
     (right - left, bottom - top, left, ascent - top)
+}
+
+/// Horizontal span, in pixels, of a cell's background and rules.
+///
+/// Returns `None` for a continuation cell (the right half of a wide character),
+/// which must not draw anything of its own: the wide glyph's quad already
+/// covers it. A wide header spans two cells.
+fn cell_span(cell: &CellContent, cell_w: f32) -> Option<f32> {
+    match cell.width {
+        0 => None,
+        w if w >= 2 => Some(cell_w * f32::from(w)),
+        _ => Some(cell_w),
+    }
 }
 
 /// Main GPU renderer for the terminal.
@@ -888,6 +915,13 @@ impl TerminalRenderer {
         let cell_h = self.cell_height as f32;
         let style = cell.style;
 
+        // A continuation cell is the right half of a wide glyph: the glyph's own
+        // quad already covers it, so drawing anything here would overpaint it.
+        // The background and rules of a wide character span both of its cells.
+        let Some(span_w) = cell_span(cell, cell_w) else {
+            return;
+        };
+
         // "Default background" (ANSI 0) means the terminal background.
         let default_bg = style.bg == TerminalColor::Named(0);
         let mut fg = self.cell_color(style.fg);
@@ -908,7 +942,7 @@ impl TerminalRenderer {
                 indices,
                 cell_x,
                 cell_y,
-                cell_w,
+                span_w,
                 cell_h,
                 solid,
                 unpack_rgba(bg),
@@ -942,7 +976,7 @@ impl TerminalRenderer {
                 indices,
                 cell_x,
                 cell_y + cell_h - rule,
-                cell_w,
+                span_w,
                 rule,
                 solid,
                 unpack_rgba(fg),
@@ -954,7 +988,7 @@ impl TerminalRenderer {
                 indices,
                 cell_x,
                 cell_y + cell_h * 0.55,
-                cell_w,
+                span_w,
                 rule,
                 solid,
                 unpack_rgba(fg),
@@ -1356,5 +1390,24 @@ mod tests {
             fit_tiling_glyph('─', &glyph(11, 3, 0, 8), 12, 22, 17.3),
             (12.0, 3.0, 0.0, 8.0),
         );
+    }
+
+    #[test]
+    fn test_cell_span_of_narrow_wide_and_continuation() {
+        let narrow = CellContent::default();
+        assert_eq!(cell_span(&narrow, 12.0), Some(12.0));
+
+        let wide = CellContent {
+            ch: '日',
+            width: 2,
+            ..CellContent::default()
+        };
+        assert_eq!(cell_span(&wide, 12.0), Some(24.0));
+
+        let continuation = CellContent {
+            width: 0,
+            ..CellContent::default()
+        };
+        assert_eq!(cell_span(&continuation, 12.0), None);
     }
 }

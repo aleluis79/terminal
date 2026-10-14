@@ -246,6 +246,93 @@
   - Hecho cuando: demo manual pasa sin errores
   - **Nota**: Se fixeó el problema de ventana invisible inicializando GPU base antes del event loop (critical para Wayland). La ventana ahora aparece correctamente.
 
+## Fase 10: Compatibilidad con aplicaciones TUI
+
+- [x] **T046: Corregir despacho de CSI con marcador privado (CL-13)**
+  - RF: RF-11, CL-13
+  - `terminal_core/src/parser.rs`: recordar el marcador privado (`?`, `>`, `<`, `=`) y no despachar `ESC[>…m`/`>…q` como su comando sin prefijo
+  - Hecho cuando: `ESC[>4;1m` no produce SGR 4;1; `ESC[?1049h` sigue entrando en alternate screen
+
+- [x] **T047: Helper de ancho de carácter (RF-44)**
+  - RF: RF-44
+  - `terminal_core`: añadir dependencia `unicode-width` y helper `char_width(c) -> 0|1|2`
+  - Hecho cuando: tests de `a`=1, `日`=2, `🦀`=2, marca combinante=0, control=0
+
+- [x] **T048: Modelo de celda con rol de ancho (RF-44, RF-45)**
+  - RF: RF-44, RF-45
+  - `terminal_core/src/cell.rs` + `grid.rs`: `Cell.width` (2 cabecera, 1 normal, 0 continuación) y helpers de pareja/limpieza
+  - Hecho cuando: tests marcan la hermana como continuación y la limpian sin afectar vecinas
+
+- [x] **T049: Escritura de caracteres anchos y ancho cero (RF-44, CL-9, CL-11)**
+  - RF: RF-44, CL-9, CL-11
+  - `terminal_core/src/engine.rs::write_char`: avanzar 1/2/0 según ancho, marcar continuación y envolver completo en la última columna
+  - Hecho cuando: `日本` ocupa 4 celdas sin partirse; combinante no avanza el cursor; tests de borde en última columna
+
+- [x] **T050: Sobrescritura y erasure limpian celdas hermanas (RF-45, CL-10)**
+  - RF: RF-45, CL-10
+  - `terminal_core/src/engine.rs` + `buffer.rs`: al escribir/borrar sobre media pareja ancha, limpiar ambas celdas (afecta ECH/EL/ED/IL/DL)
+  - Hecho cuando: escribir un angosto sobre la hermana elimina el carácter ancho; no quedan restos en erasures
+
+- [x] **T051: Render de glifos anchos sin solapes (RF-44, RF-45)**
+  - RF: RF-44, RF-45
+  - `terminal_render/src/renderer.rs`: dibujar el glifo ancho una sola vez y saltar la celda de continuación
+  - Hecho cuando: render offscreen de `日本🚀` no muestra solapes ni huecos entre glifos
+
+- [x] **T052: Reset, scroll y resize con continuaciones (RF-45, CL-4)**
+  - RF: RF-45, CL-4
+  - `terminal_core/src/buffer.rs` + `engine.rs`: clear/scroll/resize nunca dejan celdas de continuación huérfanas
+  - Hecho cuando: tras scroll y resize no hay continuaciones sin cabecera (test de invariante)
+
+- [x] **T053: Cadena de fallback de fuentes (RF-46, CL-14)**
+  - RF: RF-46, CL-14
+  - `terminal_render/src/font.rs` + `glyph.rs`: resolver cada glifo en familia → símbolos → emoji; `.notdef` solo como último recurso
+  - Hecho cuando: un glifo de símbolo/emoji se rasteriza con la fuente de respaldo; sin fuente → `.notdef` sin crash
+
+- [x] **T054: Renderizado de emoji (RF-20, RF-46)**
+  - RF: RF-20, RF-46
+  - `terminal_render/src/glyph.rs`: rasterizar emoji (monocromo/COLR) y confirmar bitmap de 2 celdas
+  - Hecho cuando: `🦀` deja de ser una caja negra y ocupa dos celdas
+
+- [x] **T055: Estado de cursor y modo sincronizado (RF-47 a RF-50)**
+  - RF: RF-47, RF-48, RF-49, RF-50
+  - `terminal_core/src/state.rs`: `Cursor.visible`/`blink`, `SavedCursor`, `TerminalModes.synchronized_output`
+  - Hecho cuando: tests de conmutación de visibilidad/parpadeo/sincronizado y de guardado/restauración
+
+- [x] **T056: Parser de `?25` (DECTCEM) y `?2026` (sincronizado) (RF-47, RF-48)**
+  - RF: RF-47, RF-48
+  - `terminal_core/src/parser.rs`: DECSET/DECRESET para 25 y 2026 → acciones `SetCursorVisible`/`SetSynchronizedOutput`
+  - Hecho cuando: tests de parseo y de aplicación al estado
+
+- [x] **T057: Parser y estado de SCP/RCP (RF-50)**
+  - RF: RF-50
+  - `terminal_core/src/parser.rs` + `engine.rs`: `ESC[s` guarda y `ESC[u` restaura posición, forma y atributos
+  - Hecho cuando: mover el cursor, `ESC[s`, escribir, `ESC[u` → vuelve a la posición guardada
+
+- [x] **T058: Parser y estado de DECSCUSR (RF-49)**
+  - RF: RF-49
+  - `terminal_core/src/parser.rs`: `ESC[Ps q` (intermedio espacio) → forma (bloque/subrayado/barra) y parpadeo según `Ps`
+  - Hecho cuando: `Ps` 0–6 producen forma y parpadeo esperados
+
+- [x] **T059: Presentar solo al cerrar la sincronización, con timeout (RF-47, CL-12)**
+  - RF: RF-47, CL-12
+  - `terminal_core/src/session.rs` + `terminal_gui`/`terminal/src/main.rs`: diferir el present entre `?2026h` y `?2026l`; presentar tras timeout si no llega el `l`
+  - Hecho cuando: `?2026h … ?2026l` produce un solo present; sin `l` la pantalla no queda congelada
+
+- [x] **T060: Respetar la visibilidad del cursor en el renderer (RF-48)**
+  - RF: RF-48
+  - `terminal_render/src/renderer.rs` + `terminal/src/main.rs`: no dibujar el cursor cuando `cursor.visible == false`
+  - Hecho cuando: `ESC[?25l` oculta el cursor y `ESC[?25h` lo vuelve a mostrar
+
+- [x] **T061: Respuestas a consultas DSR/DA (RF-51)**
+  - RF: RF-51
+  - `terminal_core/src/parser.rs` (`ESC[6n`, `ESC[c`) + `terminal/src/main.rs`: componer y escribir la respuesta al PTY
+  - Hecho cuando: DSR responde `ESC[<fila>;<columna>R` y DA responde una identificación VT/xterm
+
+- [x] **T062: Verificación end-to-end con una sesión de `opencode` (RF-44 a RF-51)**
+  - RF: RF-44 a RF-51, CL-13
+  - Regrabar `opencode` por PTY, reinyectarlo en `terminal_core` y renderizarlo offscreen; comparar rejilla contra `pyte`
+  - Hecho cuando: la rejilla coincide salvo features fuera de alcance y el frame renderizado no muestra líneas, solapes ni cajas `.notdef`
+
 ## Resumen
 
 | Fase | Tareas | RFs cubiertos |
@@ -260,5 +347,6 @@
 | 7: Input & Clipboard | T035-T037 | RF-26, RF-29, RF-30, RF-43 |
 | 8: Advanced | T038-T042 | RF-16, RF-19, RF-20, RF-22, RF-24 |
 | 9: Integration | T043-T045 | Todos |
+| 10: Compatibilidad TUI | T046-T062 | RF-44 a RF-51, CL-9 a CL-14 |
 
-**Total: 45 tareas**
+**Total: 62 tareas**

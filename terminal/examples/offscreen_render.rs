@@ -68,6 +68,7 @@ fn main() {
         CellContent {
             ch: ' ',
             style: plain,
+            width: 1,
         };
         cols * rows
     ];

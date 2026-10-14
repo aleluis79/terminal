@@ -71,6 +71,17 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - RF-42: DONDE la configuración define `colors.primary.background` y `colors.primary.foreground`, ENTONCES EL SISTEMA usa esos colores para el tema.
 - RF-43: DONDE la configuración define `keyboard.bindings`, ENTONCES EL SISTEMA usa esas combinaciones en vez de las por defecto.
 
+### Compatibilidad con aplicaciones TUI
+
+- RF-44: EL SISTEMA determina el ancho de cada carácter según Unicode (`unicode-width`): los caracteres de ancho doble (CJK, emoji anchos) ocupan dos celdas contiguas de la rejilla y desplazan el cursor dos columnas; los de ancho cero (marcas combinantes) no ocupan celda ni desplazan el cursor.
+- RF-45: DONDE un carácter se escribe o se borra sobre una de las celdas de un carácter de ancho doble, ENTONCES EL SISTEMA limpia ambas celdas para que no queden restos del carácter anterior.
+- RF-46: DONDE la fuente configurada no contiene el glifo de un carácter, EL SISTEMA lo busca en una cadena de fuentes de respaldo (símbolos y emoji) y solo dibuja el glifo `.notdef` si ninguna lo contiene.
+- RF-47: DONDE el programa activa la salida sincronizada (`ESC[?2026h`), EL SISTEMA acumula las escrituras y solo presenta el frame al recibir `ESC[?2026l`, sin mostrar estados intermedios.
+- RF-48: DONDE el programa oculta el cursor (`ESC[?25l`), ENTONCES EL SISTEMA deja de dibujarlo; DONDE lo vuelve a mostrar (`ESC[?25h`), ENTONCES EL SISTEMA vuelve a dibujarlo.
+- RF-49: DONDE el programa envía el estilo de cursor DECSCUSR (`ESC[Ps q`), ENTONCES EL SISTEMA dibuja el cursor con la forma indicada (bloque, subrayado o barra) y con parpadeo o fijo según `Ps`.
+- RF-50: DONDE el programa guarda el cursor (`ESC[s`), ENTONCES EL SISTEMA recuerda su posición y forma; DONDE lo restaura (`ESC[u`), ENTONCES EL SISTEMA vuelve a esa posición.
+- RF-51: DONDE el programa consulta la posición del cursor (`ESC[6n`), EL SISTEMA responde `ESC[<fila>;<columna>R`; DONDE consulta los colores activos (OSC 10/11/12 con `?`), EL SISTEMA responde el color correspondiente; DONDE consulta los atributos del dispositivo (`ESC[c`), EL SISTEMA responde una identificación de terminal VT/xterm.
+
 ## Requisitos no funcionales
 - Rendimiento: renderizado a 60 FPS con 10000 líneas de texto visibles.
 - Memoria: uso inferior a 100 MB en carga normal (50000 líneas de scrollback).
@@ -86,6 +97,12 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - CL-6: Se crean muchas pestañas rápidamente — EL SISTEMA no pierde ninguna sesión y no duplica procesos.
 - CL-7: Pestaña única cerrada — EL SISTEMA cierra la aplicación (no queda ventana vacía).
 - CL-8: Panel con child process que escribe más rápido de lo que se renderiza — EL SISTEMA no pierde datos en el scrollback.
+- CL-9: Carácter de ancho doble en la última columna de la línea — EL SISTEMA lo envuelve completo a la línea siguiente, sin partirlo entre dos líneas.
+- CL-10: Carácter de ancho 1 escrito sobre la mitad (celda hermana) de un carácter de ancho doble — EL SISTEMA borra el carácter ancho completo antes de escribir el nuevo.
+- CL-11: Marca combinante sin carácter base (inicio de línea o sobre una celda vacía) — EL SISTEMA la ignora sin desplazar el cursor y sin crash.
+- CL-12: Salida sincronizada activada (`?2026h`) y el programa termina sin enviar `?2026l` — EL SISTEMA presenta el estado pendiente tras un timeout, sin dejar la pantalla congelada.
+- CL-13: Secuencia CSI con marcador privado no soportado (`ESC[>…`) — EL SISTEMA la consume completa y no la interpreta como su comando sin prefijo (regresión de RF-11).
+- CL-14: Emoji o símbolo que ninguna fuente del sistema contiene — EL SISTEMA dibuja `.notdef` sin crash.
 
 ## Fuera de alcance
 - Soporte de macOS.
@@ -99,7 +116,7 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - Clipboard nativo (sin modifiers) ni drag-and-drop de archivos.
 
 ## Criterios de finalización
-- Todos los RF (1–43) tienen al menos un test automatizado o verificación manual documentada.
+- Todos los RF (1–51) tienen al menos un test automatizado o verificación manual documentada.
 - `cargo test` pasa en Linux y Windows.
 - Demo manual: abrir, crear pestañas, dividir paneles, copiar/pegar, cambiar configuración, y ejecutar `neofetch` o `htop` correctamente.
 

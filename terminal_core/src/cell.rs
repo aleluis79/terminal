@@ -1,5 +1,17 @@
 //! A single cell in the terminal grid.
 
+use unicode_width::UnicodeWidthChar;
+
+/// Display width of a character, in terminal cells.
+///
+/// Returns `2` for East Asian wide and fullwidth characters (CJK, wide emoji),
+/// `1` for ordinary characters, and `0` for combining marks, zero-width
+/// joiners and control characters. Control characters have no width of their
+/// own, so they map to `0` rather than being reported as missing.
+pub fn char_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
 /// Foreground or background color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
@@ -81,6 +93,10 @@ pub struct Cell {
     pub c: char,
     /// Text style (colors, attributes).
     pub style: CellStyle,
+    /// Display width of this cell: `2` for the left half of a wide character,
+    /// `1` for an ordinary character, `0` for the right half (continuation) of
+    /// a wide character.
+    pub width: u8,
 }
 
 impl Default for Cell {
@@ -88,6 +104,49 @@ impl Default for Cell {
         Self {
             c: ' ',
             style: CellStyle::default(),
+            width: 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::char_width;
+
+    #[test]
+    fn test_narrow_ascii() {
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(char_width('Z'), 1);
+        assert_eq!(char_width(' '), 1);
+    }
+
+    #[test]
+    fn test_wide_cjk() {
+        assert_eq!(char_width('日'), 2);
+        assert_eq!(char_width('本'), 2);
+    }
+
+    #[test]
+    fn test_wide_emoji() {
+        assert_eq!(char_width('🦀'), 2);
+    }
+
+    #[test]
+    fn test_zero_width_combining_and_joiners() {
+        // U+0301 COMBINING ACUTE ACCENT.
+        assert_eq!(char_width('\u{0301}'), 0);
+        // U+200D ZERO WIDTH JOINER.
+        assert_eq!(char_width('\u{200D}'), 0);
+    }
+
+    #[test]
+    fn test_zero_width_control() {
+        assert_eq!(char_width('\0'), 0);
+        assert_eq!(char_width('\u{07}'), 0);
+    }
+
+    #[test]
+    fn test_precomposed_accent_is_narrow() {
+        assert_eq!(char_width('á'), 1);
     }
 }

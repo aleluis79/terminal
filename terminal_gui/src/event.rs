@@ -741,6 +741,7 @@ mod tests {
                 terminal_core::cell::Cell {
                     c,
                     style: terminal_core::cell::CellStyle::default(),
+                    width: 1,
                 },
             );
         }

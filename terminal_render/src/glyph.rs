@@ -93,7 +93,14 @@ impl GlyphRenderer {
             }
 
             let mut scaler = context.builder(font_ref).size(size).hint(true).build();
-            let mut render = swash::scale::Render::new(&[swash::scale::Source::Outline]);
+            // Try outlines first (ordinary text), then color outlines and
+            // embedded bitmaps. Color emoji fonts (Noto Color Emoji) only have
+            // bitmaps, so `Outline` alone would leave them blank (RF-20).
+            let mut render = swash::scale::Render::new(&[
+                swash::scale::Source::Outline,
+                swash::scale::Source::ColorOutline(0),
+                swash::scale::Source::ColorBitmap(swash::scale::StrikeWith::BestFit),
+            ]);
             render
                 .format(swash::zeno::Format::Alpha)
                 .offset(swash::zeno::Vector::new(0.0, 0.0));
@@ -110,7 +117,16 @@ impl GlyphRenderer {
             let image = render.render(&mut scaler, glyph_id)?;
 
             let placement = image.placement;
-            let mut data = image.data;
+            // Color sources (emoji) yield 32-bit RGBA; the atlas is an 8-bit
+            // tintable alpha mask, so reduce colour to coverage.
+            let mut data = match image.content {
+                swash::scale::image::Content::Mask => image.data,
+                _ => image
+                    .data
+                    .chunks_exact(4)
+                    .map(|px| px[0].max(px[1]).max(px[2]).max(px[3]))
+                    .collect(),
+            };
             let len = (placement.width * placement.height) as usize;
             data.resize(len, 0);
 
@@ -387,6 +403,35 @@ mod tests {
         if let Some(glyph) = renderer.rasterize(&font, ' ', false, false) {
             assert!(glyph.data.iter().all(|&px| px == 0));
         }
+    }
+
+    #[test]
+    fn test_rasterize_wide_cjk_glyph() {
+        let font = FontHandle::new(&FontConfig::default());
+        if font.face_for_char('日').is_none() {
+            return; // no CJK font installed in this environment
+        }
+        let mut renderer = GlyphRenderer::new(font.pixel_size());
+        let glyph = renderer
+            .rasterize(&font, '日', false, false)
+            .expect("'日' should rasterize when a font provides it");
+        assert!(glyph.data.iter().any(|&px| px > 0), "glyph must have ink");
+    }
+
+    #[test]
+    fn test_rasterize_emoji_from_color_bitmap_font() {
+        // Emoji usually live in a colour-bitmap font; the rasterizer must fall
+        // back to the bitmaps instead of producing nothing (RF-20).
+        let font = FontHandle::new(&FontConfig::default());
+        if font.face_for_char('🦀').is_none() {
+            return; // no emoji font installed in this environment
+        }
+        let mut renderer = GlyphRenderer::new(font.pixel_size());
+        let glyph = renderer
+            .rasterize(&font, '🦀', false, false)
+            .expect("emoji should rasterize via the bitmap source");
+        assert!(glyph.width > 0 && glyph.height > 0);
+        assert!(glyph.data.iter().any(|&px| px > 0), "emoji must have ink");
     }
 
     #[test]

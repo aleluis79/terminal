@@ -90,6 +90,16 @@ pub enum Action {
     SetWindowIconAndTitle(String),
     /// Set cursor shape.
     SetCursorShape(CursorShape),
+    /// Set cursor blinking (DECSCUSR) — RF-49.
+    SetCursorBlink(bool),
+    /// Show or hide the cursor (DECTCEM, `ESC [ ? 25 h/l`) — RF-48.
+    SetCursorVisible(bool),
+    /// Start or end synchronized output (`ESC [ ? 2026 h/l`) — RF-47.
+    SetSynchronizedOutput(bool),
+    /// Save the cursor and attributes (SCP, `ESC [ s` / `ESC 7`) — RF-50.
+    SaveCursor,
+    /// Restore the cursor and attributes (RCP, `ESC [ u` / `ESC 8`) — RF-50.
+    RestoreCursor,
     /// Move cursor to position (OSC 22).
     MoveCursorTo(usize, usize),
     /// Query foreground color (OSC 10) — GUI responds with current color.
@@ -98,6 +108,10 @@ pub enum Action {
     QueryBackgroundColor,
     /// Query text color (OSC 12) — GUI responds with current color.
     QueryTextColor,
+    /// Report cursor position (DSR, `ESC [ 6 n`) — RF-51.
+    QueryCursorPosition,
+    /// Report device attributes (DA, `ESC [ c`) — RF-51.
+    QueryDeviceAttributes,
     /// Set foreground color (OSC 10).
     SetForegroundColorFromOsc(String),
     /// Set background color (OSC 11).
@@ -133,6 +147,7 @@ pub struct Parser {
     state: ParserState,
     csi_params: Vec<u16>,
     csi_intermediates: Vec<u8>,
+    csi_private: Option<u8>,
     osc_payload: Vec<u8>,
     utf8_buf: Vec<u8>,
 }
@@ -150,6 +165,7 @@ impl Parser {
             state: ParserState::Normal,
             csi_params: Vec::new(),
             csi_intermediates: Vec::new(),
+            csi_private: None,
             osc_payload: Vec::new(),
             utf8_buf: Vec::new(),
         }
@@ -192,6 +208,7 @@ impl Parser {
         self.state = ParserState::Normal;
         self.csi_params.clear();
         self.csi_intermediates.clear();
+        self.csi_private = None;
         self.osc_payload.clear();
         self.utf8_buf.clear();
     }
@@ -282,6 +299,7 @@ impl Parser {
                 self.state = ParserState::Csi;
                 self.csi_params.clear();
                 self.csi_intermediates.clear();
+                self.csi_private = None;
                 Vec::new()
             }
             b']' => {
@@ -295,6 +313,8 @@ impl Parser {
                 self.reset();
                 vec![Action::ResetAttributes]
             }
+            b'7' => vec![Action::SaveCursor],
+            b'8' => vec![Action::RestoreCursor],
             0x20..=0x2f => {
                 // Intermediate byte: `ESC <intermediate> <final>` (character
                 // set designators like `ESC ( B`, `ESC ) 0`, `ESC # 8`, …).
@@ -310,8 +330,16 @@ impl Parser {
     }
 
     fn parse_csi(&mut self, byte: u8) -> Vec<Action> {
-        if byte == 0x3f || byte == 0x3e {
-            // Private markers '?' and '>' — skip, do not add as parameter
+        if (0x3c..=0x3f).contains(&byte)
+            && self.csi_params.is_empty()
+            && self.csi_intermediates.is_empty()
+            && self.csi_private.is_none()
+        {
+            // Private parameter marker (`?`, `>`, `<`, `=`) — only valid as the
+            // first byte after `ESC [`. Remember it so the final byte is not
+            // dispatched as if it were the unprefixed command: `ESC [ > 4 ; 1 m`
+            // (XTMODKEYS) must not be read as SGR `4;1` (underline + bold).
+            self.csi_private = Some(byte);
             Vec::new()
         } else if (0x3a..=0x3d).contains(&byte) {
             // Parameter separators (:, ;, <, =) — push 0 to start new param
@@ -334,18 +362,42 @@ impl Parser {
             let actions = self.dispatch_csi(byte);
             self.csi_params.clear();
             self.csi_intermediates.clear();
+            self.csi_private = None;
             self.state = ParserState::Normal;
             actions
         } else {
             // Abort CSI
             self.csi_params.clear();
             self.csi_intermediates.clear();
+            self.csi_private = None;
             Vec::new()
         }
     }
 
     fn dispatch_csi(&self, final_byte: u8) -> Vec<Action> {
+        // A private parameter marker selects a different command set. Only the
+        // DEC private modes (`?` + `h`/`l`) map to DECSET/DECRESET here; the
+        // rest (`ESC [ > … m`, `ESC [ > … q`, `ESC [ ? … u`, …) belong to
+        // vendor extensions this parser does not implement and must not be
+        // dispatched under the unprefixed final byte.
+        if let Some(marker) = self.csi_private {
+            if self.csi_intermediates.is_empty() && marker == b'?' {
+                return match final_byte {
+                    b'h' => Parser::dispatch_decset(&self.csi_params),
+                    b'l' => Parser::dispatch_decreset(&self.csi_params),
+                    _ => Vec::new(),
+                };
+            }
+            return Vec::new();
+        }
+
         if !self.csi_intermediates.is_empty() {
+            // DECSCUSR (`ESC [ Ps SP q`) is the only sequence with an
+            // intermediate byte this parser understands.
+            if self.csi_intermediates == [b' '] && final_byte == b'q' {
+                let ps = self.csi_params.first().copied().unwrap_or(0);
+                return Parser::dispatch_decscusr(ps);
+            }
             return Vec::new();
         }
 
@@ -418,6 +470,18 @@ impl Parser {
             b'L' => vec![Action::InsertLines(
                 params.first().copied().unwrap_or(1) as usize
             )],
+            // SCP (Save Cursor Position)
+            b's' => vec![Action::SaveCursor],
+            // RCP (Restore Cursor Position)
+            b'u' => vec![Action::RestoreCursor],
+            // DSR (Device Status Report): `ESC [ 6 n` asks for the cursor
+            // position; other parameters are ignored (RF-51).
+            b'n' => match params.first().copied() {
+                Some(6) => vec![Action::QueryCursorPosition],
+                _ => Vec::new(),
+            },
+            // DA (Device Attributes): `ESC [ c` (RF-51).
+            b'c' => vec![Action::QueryDeviceAttributes],
             // DL (Delete Line)
             b'M' => vec![Action::DeleteLines(
                 params.first().copied().unwrap_or(1) as usize
@@ -503,6 +567,22 @@ impl Parser {
         }
     }
 
+    /// Map a DECSCUSR parameter to a cursor shape and blink flag (RF-49).
+    ///
+    /// `0`/`1` = blinking block, `2` = steady block, `3` = blinking underline,
+    /// `4` = steady underline, `5` = blinking bar, `6` = steady bar.
+    fn dispatch_decscusr(ps: u16) -> Vec<Action> {
+        let (shape, blink) = match ps {
+            2 => (CursorShape::Block, false),
+            3 => (CursorShape::Underline, true),
+            4 => (CursorShape::Underline, false),
+            5 => (CursorShape::Beam, true),
+            6 => (CursorShape::Beam, false),
+            _ => (CursorShape::Block, true),
+        };
+        vec![Action::SetCursorShape(shape), Action::SetCursorBlink(blink)]
+    }
+
     fn dispatch_decset(params: &[u16]) -> Vec<Action> {
         let mut actions = Vec::new();
         for &p in params {
@@ -510,6 +590,8 @@ impl Parser {
                 1049 => actions.push(Action::EnterAlternateScreen),
                 2004 => actions.push(Action::EnableBracketedPaste),
                 22 => actions.push(Action::SetCursorShape(CursorShape::Block)),
+                25 => actions.push(Action::SetCursorVisible(true)),
+                2026 => actions.push(Action::SetSynchronizedOutput(true)),
                 _ => {}
             }
         }
@@ -523,6 +605,8 @@ impl Parser {
                 1049 => actions.push(Action::ExitAlternateScreen),
                 2004 => actions.push(Action::DisableBracketedPaste),
                 22 => actions.push(Action::SetCursorShape(CursorShape::Underline)),
+                25 => actions.push(Action::SetCursorVisible(false)),
+                2026 => actions.push(Action::SetSynchronizedOutput(false)),
                 _ => {}
             }
         }
@@ -909,6 +993,116 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::EnableBracketedPaste)));
+    }
+
+    #[test]
+    fn test_private_xtmodkeys_is_not_sgr() {
+        // Regression: `ESC [ > 4 ; 1 m` (XTMODKEYS) was dispatched as SGR
+        // `4;1` (underline + bold), painting a rule under every cell of a TUI's
+        // screen-wide fill (opencode).
+        let mut parser = Parser::new();
+        let actions = parser.parse_bytes(b"\x1b[>4;1m");
+        assert_eq!(actions, Vec::new());
+    }
+
+    #[test]
+    fn test_unprefixed_sgr_still_applies() {
+        let mut parser = Parser::new();
+        let actions = parser.parse_bytes(b"\x1b[4;1m");
+        assert_eq!(
+            actions,
+            vec![Action::SetTextAttribute(4), Action::SetTextAttribute(1)]
+        );
+    }
+
+    #[test]
+    fn test_private_marker_does_not_leak_into_text() {
+        // The bytes of a private CSI must be consumed, not rendered as text.
+        let mut parser = Parser::new();
+        let actions = parser.parse_bytes(b"\x1b[>0qA");
+        assert_eq!(actions, vec![Action::Write('A')]);
+    }
+
+    #[test]
+    fn test_parse_cursor_visibility() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[?25l"),
+            vec![Action::SetCursorVisible(false)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[?25h"),
+            vec![Action::SetCursorVisible(true)]
+        );
+    }
+
+    #[test]
+    fn test_parse_synchronized_output() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[?2026h"),
+            vec![Action::SetSynchronizedOutput(true)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[?2026l"),
+            vec![Action::SetSynchronizedOutput(false)]
+        );
+    }
+
+    #[test]
+    fn test_parse_save_and_restore_cursor() {
+        let mut parser = Parser::new();
+        assert_eq!(parser.parse_bytes(b"\x1b[s"), vec![Action::SaveCursor]);
+        assert_eq!(parser.parse_bytes(b"\x1b[u"), vec![Action::RestoreCursor]);
+        // The DEC forms are equivalent.
+        assert_eq!(parser.parse_bytes(b"\x1b7"), vec![Action::SaveCursor]);
+        assert_eq!(parser.parse_bytes(b"\x1b8"), vec![Action::RestoreCursor]);
+    }
+
+    #[test]
+    fn test_private_query_keyboard_is_not_restore_cursor() {
+        // `ESC [ ? u` queries the keyboard protocol; it must not be read as RCP.
+        let mut parser = Parser::new();
+        assert_eq!(parser.parse_bytes(b"\x1b[?u"), Vec::new());
+    }
+
+    #[test]
+    fn test_parse_decscusr() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[1 q"),
+            vec![
+                Action::SetCursorShape(CursorShape::Block),
+                Action::SetCursorBlink(true)
+            ]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[6 q"),
+            vec![
+                Action::SetCursorShape(CursorShape::Beam),
+                Action::SetCursorBlink(false)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_cursor_position_request() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[6n"),
+            vec![Action::QueryCursorPosition]
+        );
+        // Other DSR parameters are not answered.
+        assert_eq!(parser.parse_bytes(b"\x1b[5n"), Vec::new());
+    }
+
+    #[test]
+    fn test_parse_device_attributes_request() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[c"),
+            vec![Action::QueryDeviceAttributes]
+        );
     }
 
     #[test]

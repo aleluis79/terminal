@@ -68,6 +68,8 @@ impl ScreenBuffer {
         self.grid.rows = rows;
         self.grid.cols = cols;
         self.grid.cells = cells;
+        // A truncated row can split a wide glyph; drop any orphaned half.
+        self.grid.sanitize_wide();
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
     }
@@ -169,15 +171,14 @@ impl ScreenBuffer {
 
     /// Clear the active region from cursor to end of screen.
     pub fn clear_from_cursor(&mut self) {
-        let cols = self.grid.cols;
-        // Clear from cursor to end of current line
-        for col in self.cursor_col..cols {
-            self.grid.cells[self.cursor_row * cols + col] = Cell::default();
+        // Clear from cursor to end of current line, keeping wide pairs whole.
+        for col in self.cursor_col..self.grid.cols {
+            self.grid.clear_cell(self.cursor_row, col);
         }
         // Clear all lines below
         for row in (self.cursor_row + 1)..self.grid.rows {
-            for col in 0..cols {
-                self.grid.cells[row * cols + col] = Cell::default();
+            for col in 0..self.grid.cols {
+                self.grid.cells[row * self.grid.cols + col] = Cell::default();
             }
         }
     }
@@ -191,13 +192,15 @@ impl ScreenBuffer {
     pub fn clear_line(&mut self) {
         let cols = self.grid.cols;
         for col in self.cursor_col..cols {
-            self.grid.cells[self.cursor_row * cols + col] = Cell::default();
+            self.grid.clear_cell(self.cursor_row, col);
         }
     }
 
     /// Erase part of a line (EL).
     ///
     /// `mode`: `0` = cursor→end, `1` = start→cursor (inclusive), `2` = whole line.
+    ///
+    /// Erasing either half of a wide character clears its other half too (RF-45).
     pub fn erase_in_line(&mut self, row: usize, col: usize, mode: u8) {
         if row >= self.grid.rows {
             return;
@@ -209,7 +212,7 @@ impl ScreenBuffer {
             _ => (col.min(cols), cols),
         };
         for c in start..end {
-            self.grid.cells[row * cols + c] = Cell::default();
+            self.grid.clear_cell(row, c);
         }
     }
 
@@ -221,7 +224,7 @@ impl ScreenBuffer {
         let cols = self.grid.cols;
         let end = col.saturating_add(n).min(cols);
         for c in col.min(cols)..end {
-            self.grid.cells[row * cols + c] = Cell::default();
+            self.grid.clear_cell(row, c);
         }
     }
 
@@ -686,5 +689,82 @@ mod tests {
 
         // Rows outside the screen are ignored instead of panicking.
         buf.erase_chars(9, 0, 4);
+    }
+
+    #[test]
+    fn test_erase_line_clears_wide_pair() {
+        // Erasing only the tail of a wide character must remove its head too.
+        let mut buf = ScreenBuffer::new(2, 10);
+        buf.grid.set_wide(
+            0,
+            2,
+            Cell {
+                c: '日',
+                ..Cell::default()
+            },
+        );
+
+        buf.erase_chars(0, 3, 1); // erase the continuation half only
+
+        assert_eq!(buf.grid.get(0, 2).c, ' ');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(buf.grid.get(0, 2).width, 1);
+    }
+
+    #[test]
+    fn test_clear_line_clears_wide_pair() {
+        let mut buf = ScreenBuffer::new(2, 10);
+        buf.grid.set_wide(
+            0,
+            4,
+            Cell {
+                c: '本',
+                ..Cell::default()
+            },
+        );
+        // Cursor on the head of the wide glyph; the tail belongs to the line.
+        buf.set_cursor(0, 4);
+        buf.clear_line();
+        assert_eq!(buf.grid.get(0, 4).c, ' ');
+        assert_eq!(buf.grid.get(0, 5).c, ' ');
+    }
+
+    #[test]
+    fn test_resize_drops_split_wide_glyph() {
+        // Shrinking the line so only the left half of a wide glyph fits must
+        // blank it, never leave a half behind (CL-4).
+        let mut buf = ScreenBuffer::new(2, 5);
+        buf.grid.set_wide(
+            0,
+            3,
+            Cell {
+                c: '日',
+                ..Cell::default()
+            },
+        );
+
+        buf.resize(2, 4); // column 4 (the continuation) is truncated
+
+        assert!(!buf.grid.is_continuation(0, 3));
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(buf.grid.get(0, 3).width, 1);
+    }
+
+    #[test]
+    fn test_resize_keeps_complete_wide_glyph() {
+        let mut buf = ScreenBuffer::new(2, 5);
+        buf.grid.set_wide(
+            0,
+            1,
+            Cell {
+                c: '本',
+                ..Cell::default()
+            },
+        );
+
+        buf.resize(2, 6);
+
+        assert_eq!(buf.grid.get(0, 1).c, '本');
+        assert!(buf.grid.is_continuation(0, 2));
     }
 }

@@ -249,3 +249,125 @@ Se implementa en orden de dependencia, con entregables incrementales:
 - `cargo test` en GitHub Actions: Linux (Ubuntu) + Windows (latest)
 - `cargo clippy -- -D warnings`
 - `cargo fmt --check`
+
+## 5. Extensión: Compatibilidad con aplicaciones TUI (RF-44 a RF-51)
+
+Esta sección amplía las anteriores y refleja la estructura real del workspace por
+crates (`terminal_core`, `terminal_render`, `terminal_gui`, `terminal`).
+
+### 5.1. Estructura de módulos afectados
+
+```
+terminal_core/src/
+├── cell.rs       # RF-44, RF-45: Cell gana el rol de ancho (cabecera/continuación)
+├── state.rs      # RF-44, RF-48, RF-49, RF-50: cursor visible/forma, SavedCursor, modo sincronizado
+├── parser.rs     # RF-47 a RF-51, CL-13: nuevas secuencias y consultas (ver 5.2)
+├── engine.rs     # RF-44, RF-45, CL-9, CL-10, CL-11: escritura/erasure con ancho
+├── buffer.rs     # RF-45: limpieza de parejas anchas, reflow y scrollback
+└── session.rs    # RF-47, RF-51: expone modo sincronizado y respuestas a consultas
+
+terminal_render/src/
+├── font.rs       # RF-46: cadena de fallback (familia → símbolos → emoji)
+├── glyph.rs      # RF-44, RF-46: glifos anchos y ausencia de `.notdef`
+└── renderer.rs   # RF-44, RF-45, RF-48: dibuja el glifo ancho una vez, salta la continuación, respeta cursor visible
+
+terminal_gui/src/ + terminal/src/main.rs
+├── window.rs     # RF-47: presentar solo al cerrar la sincronización (con timeout)
+└── main.rs       # RF-47, RF-48, RF-51: leer modos, responder consultas al PTY, ocultar cursor
+```
+
+| Módulo | Responsabilidad | RFs cubiertos |
+|--------|-----------------|---------------|
+| `core::cell` | Rol de ancho de cada celda (1/2/continuación) | RF-44, RF-45 |
+| `core::engine` | Calcular ancho al escribir y limpiar hermanas | RF-44, RF-45, CL-9 a CL-11 |
+| `core::parser` | Reconocer `?2026`, `?25`, DECSCUSR, SCP/RCP y consultas | RF-47 a RF-51, CL-13 |
+| `core::state` | `cursor.visible`, forma/parpadeo, `SavedCursor`, modo sincronizado | RF-47 a RF-50 |
+| `core::session` | Difundir modo sincronizado y componer respuestas | RF-47, RF-51 |
+| `render::font` | Cadena de fallback de fuentes | RF-46, CL-14 |
+| `render::glyph`/`renderer` | Render de glifos anchos y sin solapes | RF-44 a RF-46 |
+| `gui`/`terminal` | Presentar con sincronización, cursor visible, respuestas al PTY | RF-47, RF-48, RF-51 |
+
+### 5.2. Modelo de datos
+
+```rust
+// terminal_core/src/cell.rs — RF-44, RF-45
+struct Cell {
+    c: char,
+    style: CellStyle,
+    width: u8, // 2 = cabecera de ancho doble, 1 = normal, 0 = celda hermana/continuación
+}
+
+// terminal_core/src/state.rs — RF-44, RF-48 a RF-50
+struct Cursor {
+    row: usize,
+    col: usize,
+    shape: CursorShape,
+    visible: bool,   // DECTCEM (?25)
+    blink: bool,     // DECSCUSR 1/3/5 = parpadeante, 2/4/6 = fijo
+}
+
+struct SavedCursor {                 // ESC[s / ESC[u
+    row: usize,
+    col: usize,
+    shape: CursorShape,
+    attributes: TextAttributes,
+    fg: Color,
+    bg: Color,
+}
+
+struct TerminalModes {
+    // …existentes…
+    synchronized_output: bool,       // ?2026
+}
+
+// terminal_core/src/parser.rs — RF-47 a RF-51
+enum Action {
+    // …existentes…
+    SetCursorVisible(bool),          // RF-48
+    SetSynchronizedOutput(bool),     // RF-47
+    SaveCursor,                      // RF-50
+    RestoreCursor,                   // RF-50
+    SetCursorBlink(bool),            // RF-49
+    QueryCursorPosition,             // RF-51 (DSR, ESC[6n)
+    QueryDeviceAttributes,           // RF-51 (DA, ESC[c)
+}
+```
+
+Persistencia: sin cambios (la spec no añade estado persistente).
+
+### 5.3. Decisiones justificadas
+
+| Tema | Decisión | Alternativa descartada | Razón |
+|------|----------|------------------------|-------|
+| Ancho de carácter | crate `unicode-width` (MIT/Apache) en `terminal_core` | tabla propia; calcular en el renderer | Constitución 1 (stack mínimo y licencia) y 3 (core sin GUI); una tabla propia se desactualiza con Unicode |
+| Marcado de celdas anchas | `Cell.width` (0/1/2) con cabecera + continuación | guardar un `String`/grapheme por celda; duplicar el carácter en ambas celdas | Cambio mínimo: el atlas y la caché siguen indexados por `char`; duplicar el carácter haría que el renderer dibujase dos veces el glifo |
+| Combinantes | se ignoran si no hay carácter base | fusionar en un grapheme complejo | CL-11; el clustering completo (modo 2027) queda fuera de alcance por coste/beneficio |
+| Emoji | cadena de fallback explícita con las fuentes del sistema | incrustar una fuente de emoji como asset | Evita assets pesados (Constitución 1); CL-14 cubre el caso sin fuente |
+| Sincronizado `?2026` | flag en el buffer; el event loop no presenta entre `h` y `l`, con timeout | ignorar la secuencia | CL-12 exige no dejar la pantalla congelada si el `l` no llega |
+| Respuestas a consultas | el parser emite `Action::Query*` y el GUI compone/escribe la respuesta al PTY | responder dentro del parser/core | Constitución 3: el core no conoce tamaño en píxeles ni el color del tema |
+| DECSCUSR | `ESC[Ps q` (intermedio espacio) → forma + parpadeo | depender solo de OSC 22 | Es lo que emiten los TUIs reales (opencode envía `ESC[1 q`) |
+| Guardar/restaurar | `SavedCursor` en `TerminalState` | no soportar SCP/RCP | `ESC[s`/`ESC[u` se usan al medir el layout |
+
+### 5.4. Estrategia de tests
+
+| Unidad de requisito | Tipo | Casos representativos |
+|---------------------|------|-----------------------|
+| RF-44 | Unit (`core`) | ancho de `a`=1, `日`=2, combinante=0; el cursor avanza 1/2/0 |
+| RF-44 / CL-9 | Unit (`core`) | ancho doble en la última columna → envuelve completo, sin partirlo |
+| RF-45 / CL-10 | Unit (`core`) | escribir angosto sobre la celda hermana borra el carácter ancho; ECH/EL/IL/DL limpian parejas |
+| CL-11 | Unit (`core`) | combinante sin base → se ignora y el cursor no avanza |
+| RF-46 / CL-14 | Unit (`render`) | glifo ausente en la familia → símbolos → emoji; `.notdef` solo como último recurso |
+| RF-47 / CL-12 | Unit (`core`) + Manual | `?2026h`/`l` conmutan el modo; el timeout del GUI presenta sin `l` |
+| RF-48 | Unit (`core`) | `?25l`/`?25h` conmutan `cursor.visible` |
+| RF-49 | Unit (`core`) | `ESC[0..6 q` → forma y parpadeo correctos |
+| RF-50 | Unit (`core`) | `ESC[s` … `ESC[u` restauran posición y forma |
+| RF-51 | Unit (`core`) + Integration | DSR responde `ESC[f;cR`; DA responde identificación; OSC 10/11 `?` generan query |
+| CL-13 | Unit (`core`) | `ESC[>…m` y `ESC[>…q` no se interpretan como SGR/otro (ya cubierto) |
+
+**Verificación end-to-end (manual, no en CI):** regrabar una sesión real de
+`opencode` a través de un PTY, reinyectarla en `terminal_core` y renderizarla en
+una textura *offscreen* (ejemplos tipo `render_capture`/`dump_grid`), comparando
+rejilla y píxeles contra una referencia (`pyte`). Este procedimiento fue el que
+localizó CL-13 y sirve para validar RF-44 a RF-51 sin depender de un entorno
+gráfico.
+

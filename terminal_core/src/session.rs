@@ -17,6 +17,7 @@ use terminal_pty::unix::UnixPty;
 use terminal_pty::Pty;
 
 use crate::engine::TerminalEngine;
+use crate::parser::Action;
 use crate::state::TerminalState;
 
 /// Events emitted by a terminal session.
@@ -66,6 +67,9 @@ pub struct TerminalSession {
     running: bool,
     /// The exit code, if the session has exited.
     exit_code: Option<i32>,
+    /// GUI actions produced by the parser and not yet answered (osc queries,
+    /// cursor position requests, …) (RF-51).
+    gui_actions: Vec<Action>,
 }
 
 impl TerminalSession {
@@ -80,6 +84,7 @@ impl TerminalSession {
             pty: None,
             running: true,
             exit_code: None,
+            gui_actions: Vec::new(),
         }
     }
 
@@ -122,11 +127,19 @@ impl TerminalSession {
     /// Feed bytes from the PTY into the session.
     ///
     /// This processes incoming data from the shell through the terminal
-    /// parser, updating the grid and state accordingly.
+    /// parser, updating the grid and state accordingly. Any action that needs
+    /// the GUI (for example answering a cursor-position or colour query) is
+    /// queued and can be drained with [`take_gui_actions`](Self::take_gui_actions).
     pub fn feed(&mut self, bytes: &[u8]) {
         if self.running {
-            self.engine.input(bytes);
+            let actions = self.engine.input(bytes);
+            self.gui_actions.extend(actions);
         }
+    }
+
+    /// Take the queued GUI actions, leaving the queue empty (RF-51).
+    pub fn take_gui_actions(&mut self) -> Vec<Action> {
+        std::mem::take(&mut self.gui_actions)
     }
 
     /// Read data from the PTY and feed it into the session.
@@ -311,6 +324,18 @@ impl TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_session_queues_gui_query_actions() {
+        // RF-51: queries parsed out of the PTY stream must surface to the GUI
+        // so it can answer them.
+        let mut session = TerminalSession::new(24, 80);
+        session.feed(b"abc\x1b[6n");
+        let actions = session.take_gui_actions();
+        assert!(actions.contains(&Action::QueryCursorPosition));
+        // Draining leaves the queue empty.
+        assert!(session.take_gui_actions().is_empty());
+    }
 
     #[test]
     fn test_session_creation() {
