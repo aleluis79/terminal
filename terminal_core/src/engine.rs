@@ -111,6 +111,8 @@ impl TerminalEngine {
                 buf.delete_lines(n);
             }
             Action::LineFeed => {
+                // New output returns the view to the bottom (RF-54).
+                self.buffer.scroll_to_bottom();
                 if self.buffer.is_alternate_screen_active() {
                     self.buffer.alternate_line_feed();
                 } else {
@@ -144,9 +146,11 @@ impl TerminalEngine {
             }
             Action::EnterAlternateScreen => {
                 self.buffer.enter_alternate_screen();
+                self.buffer.scroll_to_bottom();
             }
             Action::ExitAlternateScreen => {
                 self.buffer.exit_alternate_screen();
+                self.buffer.scroll_to_bottom();
             }
             Action::EnableBracketedPaste => {
                 self.state.modes.bracketed_paste = true;
@@ -251,6 +255,9 @@ impl TerminalEngine {
     /// character that does not fit in the last column wraps to the next line
     /// *before* being written, so it is never split across two rows (CL-9).
     fn write_char(&mut self, c: char) {
+        // New output returns the view to the bottom of the buffer (RF-54).
+        self.buffer.scroll_to_bottom();
+
         let width = char_width(c);
         if width == 0 {
             // Combining marks and other zero-width characters have no cell of
@@ -418,6 +425,11 @@ impl TerminalEngine {
     /// Get a reference to the current buffer.
     pub fn buffer(&self) -> &GridBuffer {
         &self.buffer
+    }
+
+    /// Get a mutable reference to the current buffer.
+    pub fn buffer_mut(&mut self) -> &mut GridBuffer {
+        &mut self.buffer
     }
 
     /// Get a reference to the current state.
@@ -1049,5 +1061,19 @@ mod tests {
         assert!(actions.contains(&Action::QueryCursorPosition));
         let actions = engine.input(b"\x1b[c");
         assert!(actions.contains(&Action::QueryDeviceAttributes));
+    }
+
+    #[test]
+    fn test_new_output_resets_the_scroll_view() {
+        // RF-54: once the view is scrolled back, new output returns to the end.
+        let mut engine = TerminalEngine::new(2, 8);
+        engine.input(b"one\r\ntwo\r\nthree\r\nfour");
+        assert!(engine.buffer_mut().scrollback_len() > 0);
+
+        engine.buffer_mut().scroll_back(2);
+        assert!(engine.buffer().scroll_offset() > 0);
+
+        engine.input(b"x");
+        assert_eq!(engine.buffer().scroll_offset(), 0);
     }
 }

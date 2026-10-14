@@ -680,8 +680,63 @@ impl AppInner {
                 let text = self.clipboard.get_text();
                 self.paste_text(&text);
             }
+            GuiAction::ScrollLineUp => self.scroll_view(1),
+            GuiAction::ScrollLineDown => self.scroll_view(-1),
+            GuiAction::ScrollPageUp => {
+                let page = (self.grid_rows.saturating_sub(1)).max(1);
+                self.scroll_view(i32::try_from(page).unwrap_or(i32::MAX));
+            }
+            GuiAction::ScrollPageDown => {
+                let page = (self.grid_rows.saturating_sub(1)).max(1);
+                self.scroll_view(-i32::try_from(page).unwrap_or(i32::MAX));
+            }
+            GuiAction::ScrollTop => self.scroll_view_to_edge(true),
+            GuiAction::ScrollBottom => self.scroll_view_to_edge(false),
             GuiAction::None => {}
         }
+    }
+
+    /// Scroll the view of the pane under the cursor (or the focused pane).
+    ///
+    /// Positive `lines` scrolls back into the history, negative returns towards
+    /// the newest output (RF-53).
+    fn scroll_view(&mut self, lines: i32) {
+        if lines == 0 {
+            return;
+        }
+        let Some(session) = self.scroll_target_session() else {
+            return;
+        };
+        let buffer = session.engine_mut().buffer_mut();
+        if lines > 0 {
+            buffer.scroll_back(lines.unsigned_abs() as usize);
+        } else {
+            buffer.scroll_forward(lines.unsigned_abs() as usize);
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Jump the view of the pane under the cursor to the top or bottom.
+    fn scroll_view_to_edge(&mut self, top: bool) {
+        let Some(session) = self.scroll_target_session() else {
+            return;
+        };
+        let buffer = session.engine_mut().buffer_mut();
+        if top {
+            buffer.scroll_to_top();
+        } else {
+            buffer.scroll_to_bottom();
+        }
+        self.needs_redraw = true;
+    }
+
+    /// The session to scroll: the pane under the mouse, else the focused pane.
+    fn scroll_target_session(&mut self) -> Option<&mut TerminalSession> {
+        let panel = self
+            .pane_at(self.last_mouse_position)
+            .map(|(id, _)| id)
+            .or_else(|| self.active_tab_state().map(|s| s.layout.focused_panel()))?;
+        self.active_tab_state_mut()?.panes.get_mut(&panel)
     }
 
     /// Text currently selected in the active pane, if any.
@@ -851,19 +906,22 @@ impl AppInner {
                     continue;
                 };
                 let engine = session.engine();
-                let buf = engine.buffer().active();
+                let grid_buffer = engine.buffer();
                 let st = engine.state();
+                let cols = grid_buffer.active().grid.cols;
 
-                let cells: Vec<terminal_render::renderer::CellContent> = (0..buf.grid.rows)
+                // Rows as seen through the scroll offset: history lines first,
+                // then the active grid (RF-53).
+                let cells: Vec<terminal_render::renderer::CellContent> = grid_buffer
+                    .visible_rows()
+                    .iter()
                     .flat_map(|row| {
-                        (0..buf.grid.cols).map(move |col| {
-                            let cell = buf.grid.get(row, col);
-                            terminal_render::renderer::CellContent {
+                        row.iter()
+                            .map(|cell| terminal_render::renderer::CellContent {
                                 ch: cell.c,
                                 style: cell.style,
                                 width: cell.width,
-                            }
-                        })
+                            })
                     })
                     .collect();
 
@@ -873,14 +931,20 @@ impl AppInner {
                     terminal_core::state::CursorShape::Beam => CursorShape::Beam,
                 };
 
+                // The cursor is hidden while the view is scrolled back (RF-54).
+                let cursor_visible = id == focused
+                    && self.cursor_visible
+                    && st.cursor.visible
+                    && grid_buffer.scroll_offset() == 0;
+
                 pane_cells.push(cells);
                 pane_specs.push(PaneSpec {
                     rect,
                     cursor_shape,
                     cursor_row: st.cursor.row,
                     cursor_col: st.cursor.col,
-                    cursor_visible: id == focused && self.cursor_visible && st.cursor.visible,
-                    cols: buf.grid.cols,
+                    cursor_visible,
+                    cols,
                     selection: if selection_pane == Some(id) {
                         Selection {
                             start: selection.start,
@@ -1097,6 +1161,16 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let mut state = self.state.lock().unwrap();
                 state.process_mouse_motion((position.x, position.y));
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let mut state = self.state.lock().unwrap();
+                let (_cell_w, cell_h) = state.cell_size();
+                let lines: f64 = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y / f64::from(cell_h.max(1)),
+                };
+                // Wheel up (positive) scrolls back into the history (RF-53).
+                state.scroll_view(lines.round() as i32);
             }
             WindowEvent::Resized(size) => {
                 let mut state = self.state.lock().unwrap();

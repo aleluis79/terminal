@@ -12,6 +12,7 @@ fn main() {
     let path = args.get(1).expect("usage: dump_grid <file> [rows cols]");
     let rows: usize = args.get(2).map_or(40, |v| v.parse().unwrap());
     let cols: usize = args.get(3).map_or(120, |v| v.parse().unwrap());
+    let scroll: usize = args.get(4).map_or(0, |v| v.parse().unwrap());
 
     let mut bytes = Vec::new();
     std::fs::File::open(path)
@@ -21,13 +22,10 @@ fn main() {
 
     let mut engine = terminal_core::engine::TerminalEngine::new(rows, cols);
     engine.input(&bytes);
+    engine.buffer_mut().scroll_back(scroll);
 
-    let grid = &engine.buffer().active().grid;
-    for row in 0..grid.rows {
-        let mut line = String::new();
-        for col in 0..grid.cols {
-            line.push(grid.get(row, col).c);
-        }
+    for row in engine.buffer().visible_rows() {
+        let line: String = row.iter().map(|cell| cell.c).collect();
         println!("{}", line.trim_end());
     }
 }

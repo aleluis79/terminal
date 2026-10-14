@@ -255,23 +255,15 @@ impl ScreenBuffer {
 pub struct GridBuffer {
     /// Main screen buffer.
     main: ScreenBuffer,
-    /// Scrollback history.
-    scrollback: VecDeque<ScrollbackEntry>,
+    /// Scrollback history: whole lines (rows) that scrolled off the top, oldest
+    /// first.
+    scrollback: VecDeque<Vec<Cell>>,
     /// Alternate screen buffer (when `alternate_screen` mode is active).
     alternate: Option<ScreenBuffer>,
     /// Scrollback limit.
     scrollback_limit: usize,
-}
-
-#[derive(Debug, Clone)]
-#[expect(dead_code)]
-struct ScrollbackEntry {
-    /// The grid content.
-    grid: Grid,
-    /// Cursor row position.
-    cursor_row: usize,
-    /// Cursor column position.
-    cursor_col: usize,
+    /// How many lines the view is scrolled back into the history.
+    scroll_offset: usize,
 }
 
 impl GridBuffer {
@@ -282,6 +274,7 @@ impl GridBuffer {
             scrollback: VecDeque::new(),
             alternate: None,
             scrollback_limit: DEFAULT_SCROLLBACK_LIMIT,
+            scroll_offset: 0,
         }
     }
 
@@ -323,8 +316,6 @@ impl GridBuffer {
     /// Enter alternate screen mode.
     pub fn enter_alternate_screen(&mut self) {
         if self.alternate.is_none() {
-            // Save main screen to scrollback before switching
-            self.save_to_scrollback();
             self.alternate = Some(ScreenBuffer::new(self.main.grid.rows, self.main.grid.cols));
         }
     }
@@ -345,15 +336,14 @@ impl GridBuffer {
         }
     }
 
-    /// Save current main screen to scrollback.
-    fn save_to_scrollback(&mut self) {
-        let entry = ScrollbackEntry {
-            grid: self.main.grid.clone(),
-            cursor_row: self.main.cursor_row,
-            cursor_col: self.main.cursor_col,
-        };
-        self.scrollback.push_back(entry);
-        // Limit scrollback size
+    /// Append the top line of the main screen to the scrollback.
+    ///
+    /// Called when the screen scrolls up: the row that leaves the top becomes
+    /// history. The oldest lines are dropped once the limit is reached.
+    fn push_scrollback_line(&mut self) {
+        let cols = self.main.grid.cols;
+        let line: Vec<Cell> = (0..cols).map(|col| self.main.grid.get(0, col)).collect();
+        self.scrollback.push_back(line);
         while self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
         }
@@ -365,18 +355,21 @@ impl GridBuffer {
     }
 
     /// Get a scrollback line by index (0 = oldest).
-    pub fn scrollback_line(&self, index: usize) -> Option<Grid> {
-        self.scrollback.get(index).map(|e| e.grid.clone())
+    pub fn scrollback_line(&self, index: usize) -> Option<&[Cell]> {
+        self.scrollback.get(index).map(Vec::as_slice)
     }
 
     /// Clear scrollback.
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
+        self.scroll_offset = 0;
     }
 
-    /// Handle a line feed on the main buffer.
+    /// Handle a line feed on the main buffer, recording the line that leaves
+    /// the top of the screen in the scrollback.
     pub fn main_line_feed(&mut self) {
         if self.main.cursor_row + 1 >= self.main.grid.rows {
+            self.push_scrollback_line();
             self.main.scroll_up(1);
             // After scroll, cursor stays at the last row
             self.main.cursor_row = self.main.grid.rows - 1;
@@ -396,6 +389,70 @@ impl GridBuffer {
                 alt.cursor_row += 1;
             }
         }
+    }
+
+    /// Number of lines the view is scrolled back into the history (0 = bottom).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Scroll the view back by `n` lines, towards older output (RF-53).
+    ///
+    /// The offset stops at the oldest history line (CL-15) and is ignored while
+    /// the alternate screen is active, which has no history (CL-16).
+    pub fn scroll_back(&mut self, n: usize) {
+        if self.is_alternate_screen_active() {
+            return;
+        }
+        self.scroll_offset = (self.scroll_offset + n).min(self.scrollback.len());
+    }
+
+    /// Scroll the view forward by `n` lines, towards the newest output.
+    pub fn scroll_forward(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    /// Jump to the bottom of the buffer (newest output).
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// Jump to the oldest line of the history (RF-53).
+    pub fn scroll_to_top(&mut self) {
+        if self.is_alternate_screen_active() {
+            return;
+        }
+        self.scroll_offset = self.scrollback.len();
+    }
+
+    /// The rows to draw, as seen through the current scroll offset (RF-53).
+    ///
+    /// Returns `rows` rows: `scroll_offset` lines from the end of the history,
+    /// followed by the top of the active grid.
+    pub fn visible_rows(&self) -> Vec<Vec<Cell>> {
+        let grid = &self.active().grid;
+        let rows = grid.rows;
+        let cols = grid.cols;
+        let history = self.scrollback.len();
+        let offset = self.scroll_offset.min(history);
+        // Virtual line index where the window starts.
+        let start = history - offset;
+
+        let mut out = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let line = start + i;
+            if line < history {
+                out.push(self.scrollback[line].clone());
+            } else {
+                let row = line - history;
+                if row < rows {
+                    out.push((0..cols).map(|col| grid.get(row, col)).collect());
+                } else {
+                    out.push(vec![Cell::default(); cols]);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -642,9 +699,136 @@ mod tests {
         let mut buf = GridBuffer::new(3, 5);
         buf.scrollback_limit = 5;
         for _ in 0..10 {
-            buf.save_to_scrollback();
+            buf.push_scrollback_line();
         }
         assert!(buf.scrollback_len() <= 5);
+    }
+
+    #[test]
+    fn test_main_line_feed_records_scrollback() {
+        // A line that leaves the top of the screen becomes history.
+        let mut buf = GridBuffer::new(2, 4);
+        for (col, c) in "top!".chars().enumerate() {
+            buf.main.grid.set(
+                0,
+                col,
+                Cell {
+                    c,
+                    ..Cell::default()
+                },
+            );
+        }
+        buf.main.cursor_row = 1;
+        buf.main_line_feed();
+
+        assert_eq!(buf.scrollback_len(), 1);
+        let line = buf.scrollback_line(0).expect("one history line");
+        let text: String = line.iter().map(|cell| cell.c).collect();
+        assert_eq!(text, "top!");
+    }
+
+    #[test]
+    fn test_line_feed_without_scrolling_records_nothing() {
+        let mut buf = GridBuffer::new(4, 4);
+        buf.main.cursor_row = 0;
+        buf.main_line_feed();
+        assert_eq!(buf.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn test_visible_rows_shows_history_then_grid() {
+        let mut buf = GridBuffer::new(2, 4);
+        // Two lines of history: "AAAA", then "BBBB".
+        for (col, c) in "AAAA".chars().enumerate() {
+            buf.main.grid.set(
+                0,
+                col,
+                Cell {
+                    c,
+                    ..Cell::default()
+                },
+            );
+        }
+        buf.main.cursor_row = 1;
+        buf.main_line_feed(); // history: AAAA
+        for col in 0..4 {
+            buf.main.grid.set(
+                0,
+                col,
+                Cell {
+                    c: 'B',
+                    ..Cell::default()
+                },
+            );
+        }
+        buf.main.cursor_row = 1;
+        buf.main_line_feed(); // history: AAAA, BBBB
+                              // Paint the current screen row (the grid is otherwise blank).
+        for col in 0..4 {
+            buf.main.grid.set(
+                0,
+                col,
+                Cell {
+                    c: 'C',
+                    ..Cell::default()
+                },
+            );
+        }
+
+        // At the bottom the view is just the active grid.
+        let bottom = buf.visible_rows();
+        assert_eq!(row_text(&bottom[0]), "CCCC");
+
+        // One line back shows the newest history line above the grid.
+        buf.scroll_back(1);
+        let scrolled = buf.visible_rows();
+        assert_eq!(row_text(&scrolled[0]), "BBBB");
+        assert_eq!(row_text(&scrolled[1]), "CCCC");
+
+        // Two lines back shows the whole (two-line) history.
+        buf.scroll_back(1);
+        let top = buf.visible_rows();
+        assert_eq!(row_text(&top[0]), "AAAA");
+        assert_eq!(row_text(&top[1]), "BBBB");
+    }
+
+    #[test]
+    fn test_scroll_back_stops_at_oldest_line() {
+        let mut buf = GridBuffer::new(2, 4);
+        buf.push_scrollback_line();
+        buf.push_scrollback_line();
+        buf.scroll_back(100);
+        assert_eq!(buf.scroll_offset(), 2);
+        // Scrolling further cannot go past the oldest line.
+        assert_eq!(buf.visible_rows().len(), 2);
+    }
+
+    #[test]
+    fn test_scroll_forward_and_to_bottom() {
+        let mut buf = GridBuffer::new(2, 4);
+        buf.push_scrollback_line();
+        buf.push_scrollback_line();
+        buf.scroll_back(2);
+        buf.scroll_forward(1);
+        assert_eq!(buf.scroll_offset(), 1);
+        buf.scroll_to_bottom();
+        assert_eq!(buf.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn test_scroll_is_ignored_on_alternate_screen() {
+        let mut buf = GridBuffer::new(2, 4);
+        buf.push_scrollback_line();
+        buf.enter_alternate_screen();
+        buf.scroll_back(5);
+        assert_eq!(buf.scroll_offset(), 0);
+        buf.scroll_to_top();
+        assert_eq!(buf.scroll_offset(), 0);
+    }
+
+    /// Text of a row of cells.
+    fn row_text(row: &[Cell]) -> String {
+        row.iter().map(|cell| cell.c).collect()
     }
 
     #[test]

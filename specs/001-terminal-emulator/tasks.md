@@ -342,6 +342,28 @@
   - `terminal/src/main.rs`: pasar los divisores de la pestaña activa
   - Hecho cuando: con 2+ paneles aparece una línea de 1 px entre ellos; sin splits, ninguna
 
+## Fase 12: Desplazamiento vertical
+
+- [x] **T064: Historial de scrollback por líneas (RF-15, RF-53)**
+  - RF: RF-15, RF-53
+  - `terminal_core/src/buffer.rs`: `scrollback: VecDeque<Vec<Cell>>`; `main_line_feed` guarda la fila que sale; límite de 10000
+  - Hecho cuando: tras N line feeds el historial tiene las líneas correctas y respeta el límite
+
+- [x] **T065: Offset de vista y `visible_rows` (RF-53, RF-54, CL-15, CL-16)**
+  - RF: RF-53, RF-54, CL-15, CL-16
+  - `terminal_core/src/buffer.rs` + `engine.rs`: `scroll_back/forward/to_bottom/to_top`, `visible_rows`, reset al escribir salida, historial ignorado en pantalla alterna
+  - Hecho cuando: la vista mezcla historial y rejilla activa; el scroll se detiene en el tope; nueva salida vuelve al final
+
+- [x] **T066: Entrada de scroll (rueda y teclado) (RF-53)**
+  - RF: RF-53
+  - `terminal_gui/src/keymap.rs` (`GuiAction` + bindings Shift+PageUp/PageDown/Home/End) y `terminal/src/main.rs` (rueda del ratón, despacho al panel activo, reset del cursor)
+  - Hecho cuando: la rueda y los atajos desplazan la vista del panel activo
+
+- [x] **T067: Verificación del desplazamiento (RF-53, RF-54)**
+  - RF: RF-53, RF-54, CL-15, CL-16
+  - Render del panel desplazado con `render_capture`/sonda y comparación con la rejilla; sin cursor mientras hay desplazamiento
+  - Hecho cuando: el contenido desplazado es el historial correcto y el cursor no se dibuja
+
 ## Resumen
 
 | Fase | Tareas | RFs cubiertos |
@@ -358,5 +380,6 @@
 | 9: Integration | T043-T045 | Todos |
 | 10: Compatibilidad TUI | T046-T062 | RF-44 a RF-51, CL-9 a CL-14 |
 | 11: Divisor de paneles | T063 | RF-52 |
+| 12: Desplazamiento vertical | T064-T067 | RF-53, RF-54, CL-15, CL-16 |
 
-**Total: 63 tareas**
+**Total: 67 tareas**

@@ -86,6 +86,11 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 
 - RF-52: DONDE una pestaña tiene más de un panel, EL SISTEMA dibuja una línea divisoria visible en el hueco entre paneles adyacentes, con el color de acento del tema.
 
+### Desplazamiento
+
+- RF-53: DONDE el usuario gira la rueda del ratón sobre un panel, o pulsa Shift+PageUp/PageDown/Home/End con el panel enfocado, EL SISTEMA desplaza la vista verticalmente por el historial de scrollback (hasta el límite de RF-15) sin modificar el contenido del buffer.
+- RF-54: MIENTRAS la vista está desplazada hacia el historial, EL SISTEMA no dibuja el cursor; CUANDO el programa escribe nueva salida, EL SISTEMA vuelve al final del buffer.
+
 ## Requisitos no funcionales
 - Rendimiento: renderizado a 60 FPS con 10000 líneas de texto visibles.
 - Memoria: uso inferior a 100 MB en carga normal (50000 líneas de scrollback).
@@ -107,6 +112,8 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - CL-12: Salida sincronizada activada (`?2026h`) y el programa termina sin enviar `?2026l` — EL SISTEMA presenta el estado pendiente tras un timeout, sin dejar la pantalla congelada.
 - CL-13: Secuencia CSI con marcador privado no soportado (`ESC[>…`) — EL SISTEMA la consume completa y no la interpreta como su comando sin prefijo (regresión de RF-11).
 - CL-14: Emoji o símbolo que ninguna fuente del sistema contiene — EL SISTEMA dibuja `.notdef` sin crash.
+- CL-15: La vista se desplaza más allá de la línea más antigua del historial — EL SISTEMA se detiene en la más antigua y no falla.
+- CL-16: Rueda del ratón con la pantalla alterna activa — EL SISTEMA ignora el desplazamiento (la pantalla alterna no tiene historial).
 
 ## Fuera de alcance
 - Soporte de macOS.
@@ -120,7 +127,7 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - Clipboard nativo (sin modifiers) ni drag-and-drop de archivos.
 
 ## Criterios de finalización
-- Todos los RF (1–52) tienen al menos un test automatizado o verificación manual documentada.
+- Todos los RF (1–54) tienen al menos un test automatizado o verificación manual documentada.
 - `cargo test` pasa en Linux y Windows.
 - Demo manual: abrir, crear pestañas, dividir paneles, copiar/pegar, cambiar configuración, y ejecutar `neofetch` o `htop` correctamente.
 

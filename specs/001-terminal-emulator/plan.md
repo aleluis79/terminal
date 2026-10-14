@@ -392,4 +392,65 @@ Tests: Unit (`gui::split`) de `divider_rects` (1 split → 1 rectángulo en el
 hueco correcto; 2 splits anidados → 2 rectángulos) y verificación visual con
 `render_capture` sobre una captura con paneles divididos.
 
+## 6. Desplazamiento vertical del scrollback (RF-53, RF-54)
+
+Hoy el scrollback existe pero nunca se alimenta (solo se guardaba la pantalla
+entera al entrar en la pantalla alterna) y el render siempre dibuja la rejilla
+activa. Se pasa a un historial por líneas con un desplazamiento de vista.
+
+### 6.1. Estructura de módulos
+
+| Módulo | Responsabilidad | RF |
+|--------|-----------------|----|
+| `core::buffer` | Historial por líneas (`VecDeque<Vec<Cell>>`), población al hacer scroll, offset de vista y `visible_rows` | RF-15, RF-53, RF-54 |
+| `core::engine` | Vuelve al final del buffer al escribir nueva salida | RF-54 |
+| `gui::keymap` | Nuevas `GuiAction` de scroll y bindings por defecto (Shift+…) | RF-53 |
+| `terminal` | Rueda del ratón y despacho de las `GuiAction` de scroll al panel activo | RF-53 |
+
+### 6.2. Modelo de datos
+
+```rust
+struct GridBuffer {
+    // …existente…
+    scrollback: VecDeque<Vec<Cell>>, // una línea (fila) por entrada
+    scroll_offset: usize,            // líneas desplazadas hacia el historial
+}
+
+impl GridBuffer {
+    fn push_scrollback_line(&mut self);      // copia la fila 0 que sale
+    pub fn scroll_back(&mut self, n: usize); // limitado por scrollback.len()
+    pub fn scroll_forward(&mut self, n: usize);
+    pub fn scroll_to_bottom(&mut self);
+    pub fn scroll_to_top(&mut self);
+    pub fn visible_rows(&self) -> Vec<Vec<Cell>>; // historial + rejilla activa
+}
+```
+
+Notas de decisión: se descarta guardar la pantalla entera por entrada
+(desperdicio y semántica incorrecta); el historial es por línea, como en
+xterm. `visible_rows` devuelve `offset` líneas del final del historial seguidas
+de las primeras `rows - offset` de la rejilla activa.
+
+### 6.3. Decisiones justificadas
+
+| Tema | Decisión | Alternativa descartada | Razón |
+|------|----------|------------------------|-------|
+| Grano del historial | una línea (`Vec<Cell>`) por entrada | `Grid` completo por entrada | Coste de memoria y semántica de líneas de xterm; el código actual guardaba pantallas enteras |
+| Dónde vive el offset | `GridBuffer` (por panel) | estado global del GUI | Cada panel tiene su propio historial y desplazamiento |
+| Reset | nueva salida (`write_char`) vuelve al final | mantener la vista hasta que el usuario baje | Es el comportamiento esperado de una terminal |
+| Pantalla alterna | sin historial (offset 0) | reutilizar el historial del main | La pantalla alterna no tiene scrollback (CL-16) |
+| Entrada | rueda + Shift+PageUp/PageDown/Home/End | solo rueda | Cubre teclado sin depender del protocolo de ratón del programa |
+
+### 6.4. Estrategia de tests
+
+| RF / CL | Tipo | Casos |
+|---------|------|-------|
+| RF-15, RF-53 | Unit (`core`) | `main_line_feed` llena el historial; el límite se respeta |
+| RF-53 / CL-15 | Unit (`core`) | `scroll_back` se detiene en la línea más antigua |
+| RF-53 | Unit (`core`) | `visible_rows` mezcla historial y rejilla activa en el orden correcto |
+| RF-54 / CL-16 | Unit (`core`) | escribir nueva salida resetea el offset; la pantalla alterna ignora el scroll |
+| RF-53 | Unit (`gui`) | los bindings Shift+PageUp/PageDown/Home/End resuelven a las nuevas acciones |
+| RF-53 | Manual | rueda del ratón en la app con salida larga (`seq 1 200`) |
+
+
 

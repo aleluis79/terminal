@@ -29,10 +29,13 @@ fn main() {
         .expect("usage: render_capture <in> <out.ppm> [rows cols]");
     let rows: usize = args.get(3).map_or(40, |v| v.parse().unwrap());
     let cols: usize = args.get(4).map_or(120, |v| v.parse().unwrap());
+    let scroll: usize = args.get(5).map_or(0, |v| v.parse().unwrap());
 
     let bytes = std::fs::read(path).expect("read capture");
     let mut engine = terminal_core::engine::TerminalEngine::new(rows, cols);
     engine.input(&bytes);
+    // Render the view through the scroll offset, exactly like `main.rs` does.
+    engine.buffer_mut().scroll_back(scroll);
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -60,11 +63,9 @@ fn main() {
     let width = cell_w * cols as u32;
     let height = cell_h * rows as u32;
 
-    let grid = &engine.buffer().active().grid;
     let mut cells = Vec::with_capacity(rows * cols);
-    for row in 0..rows {
-        for col in 0..cols {
-            let cell = grid.get(row, col);
+    for row in engine.buffer().visible_rows() {
+        for cell in &row {
             cells.push(CellContent {
                 ch: cell.c,
                 style: cell.style,

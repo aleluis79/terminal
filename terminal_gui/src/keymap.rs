@@ -42,6 +42,18 @@ pub enum GuiAction {
     Copy,
     /// Paste clipboard content to active panel.
     Paste,
+    /// Scroll the view up one line.
+    ScrollLineUp,
+    /// Scroll the view down one line.
+    ScrollLineDown,
+    /// Scroll the view up one page.
+    ScrollPageUp,
+    /// Scroll the view down one page.
+    ScrollPageDown,
+    /// Jump the view to the oldest history line.
+    ScrollTop,
+    /// Jump the view to the newest output.
+    ScrollBottom,
     /// No action (key not bound).
     None,
 }
@@ -222,6 +234,23 @@ impl Keymap {
                 key: KeyCombination::new("v", ctrl_shift),
                 action: GuiAction::Paste,
             },
+            // Vertical scroll (RF-53)
+            KeyBinding {
+                key: KeyCombination::new("pageup", ModifiersState::SHIFT),
+                action: GuiAction::ScrollPageUp,
+            },
+            KeyBinding {
+                key: KeyCombination::new("pagedown", ModifiersState::SHIFT),
+                action: GuiAction::ScrollPageDown,
+            },
+            KeyBinding {
+                key: KeyCombination::new("home", ModifiersState::SHIFT),
+                action: GuiAction::ScrollTop,
+            },
+            KeyBinding {
+                key: KeyCombination::new("end", ModifiersState::SHIFT),
+                action: GuiAction::ScrollBottom,
+            },
         ]
     }
 }
@@ -253,6 +282,10 @@ fn key_to_string(key: &Key) -> String {
         Key::Named(NamedKey::ArrowRight) => "right".to_string(),
         Key::Named(NamedKey::ArrowUp) => "up".to_string(),
         Key::Named(NamedKey::ArrowLeft) => "left".to_string(),
+        Key::Named(NamedKey::PageUp) => "pageup".to_string(),
+        Key::Named(NamedKey::PageDown) => "pagedown".to_string(),
+        Key::Named(NamedKey::Home) => "home".to_string(),
+        Key::Named(NamedKey::End) => "end".to_string(),
         _ => String::new(),
     }
 }
@@ -274,6 +307,10 @@ pub fn key_code_to_key(code: KeyCode) -> String {
         KeyCode::ArrowUp => "up".to_string(),
         KeyCode::ArrowLeft => "left".to_string(),
         KeyCode::Tab => "Tab".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
         _ => String::new(),
     }
 }
@@ -457,6 +494,29 @@ mod tests {
     }
 
     #[test]
+    fn test_keymap_resolve_scroll_bindings() {
+        let keymap = Keymap::default();
+        let shift = ModifiersState::SHIFT;
+
+        assert_eq!(
+            keymap.resolve(&Key::Named(NamedKey::PageUp), &shift),
+            GuiAction::ScrollPageUp
+        );
+        assert_eq!(
+            keymap.resolve(&Key::Named(NamedKey::PageDown), &shift),
+            GuiAction::ScrollPageDown
+        );
+        assert_eq!(
+            keymap.resolve(&Key::Named(NamedKey::Home), &shift),
+            GuiAction::ScrollTop
+        );
+        assert_eq!(
+            keymap.resolve(&Key::Named(NamedKey::End), &shift),
+            GuiAction::ScrollBottom
+        );
+    }
+
+    #[test]
     fn test_all_default_actions_present() {
         let keymap = Keymap::default();
         let actions: Vec<GuiAction> = keymap.default_bindings().iter().map(|b| b.action).collect();
@@ -474,5 +534,9 @@ mod tests {
         assert!(actions.contains(&GuiAction::NavigateRight));
         assert!(actions.contains(&GuiAction::Copy));
         assert!(actions.contains(&GuiAction::Paste));
+        assert!(actions.contains(&GuiAction::ScrollPageUp));
+        assert!(actions.contains(&GuiAction::ScrollPageDown));
+        assert!(actions.contains(&GuiAction::ScrollTop));
+        assert!(actions.contains(&GuiAction::ScrollBottom));
     }
 }
