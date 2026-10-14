@@ -12,7 +12,7 @@
 //! - C0 and C1 control codes
 
 use crate::cell::Color;
-use crate::state::{CursorShape, TextAttributes};
+use crate::state::CursorShape;
 
 /// An action produced by the parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,8 @@ pub enum Action {
     CursorBackward(usize),
     /// Move cursor to the given column, keeping the current row (CHA).
     CursorToColumn(usize),
+    /// Move cursor to the given row, keeping the current column (VPA).
+    CursorToRow(usize),
     /// Send cursor to beginning of line.
     CursorHome,
     /// Erase part of the current line (EL).
@@ -43,6 +45,8 @@ pub enum Action {
     /// The value is the ECMA-48 mode: `0` = cursor→end, `1` = start→cursor,
     /// `2` = whole screen.
     EraseInDisplay(u8),
+    /// Erase `n` characters starting at the cursor, without moving it (ECH).
+    EraseChars(usize),
     /// Insert n lines.
     InsertLines(usize),
     /// Delete n lines.
@@ -54,7 +58,12 @@ pub enum Action {
     /// Backspace.
     Backspace,
     /// Set text attributes (SGR).
-    SetAttributes(TextAttributes),
+    ///
+    /// Carries a single SGR parameter, which the engine applies to the
+    /// attributes it already has: `ESC [ 1 m` followed by `ESC [ 31 m` must
+    /// keep the text bold, so a colour sequence may not replace the whole
+    /// attribute set.
+    SetTextAttribute(u16),
     /// Set foreground color.
     SetForegroundColor(Color),
     /// Set background color.
@@ -386,6 +395,15 @@ impl Parser {
                 let col = params.get(1).copied().unwrap_or(1).saturating_sub(1) as usize;
                 vec![Action::CursorPosition(row, col)]
             }
+            // VPA (Vertical Position Absolute): move to row only, keep column
+            b'd' => {
+                let row = params.first().copied().unwrap_or(1).saturating_sub(1) as usize;
+                vec![Action::CursorToRow(row)]
+            }
+            // ECH (Erase Character): blank n cells without moving the cursor
+            b'X' => vec![Action::EraseChars(
+                params.first().copied().unwrap_or(1) as usize
+            )],
             // ED (Erase in Display)
             b'J' => match params.first().copied().unwrap_or(0) {
                 mode @ 0..=2 => vec![Action::EraseInDisplay(mode as u8)],
@@ -412,81 +430,77 @@ impl Parser {
         }
     }
 
+    /// Dispatch an SGR (Select Graphic Rendition) sequence.
+    ///
+    /// Each parameter is emitted as its own action so the engine applies it to
+    /// the attributes and colours it already has. Emitting the whole attribute
+    /// set here would make any colour sequence (`ESC [ 38;5;2 m`) clear the
+    /// bold or italic set by an earlier one.
     fn dispatch_sgr(params: &[u16]) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let mut attrs = TextAttributes::default();
-        let mut fg_color = None;
-        let mut bg_color = None;
+        // A bare `ESC [ m` is `ESC [ 0 m`.
+        if params.is_empty() {
+            return vec![Action::ResetAttributes];
+        }
 
+        let mut actions = Vec::new();
         let mut i = 0;
         while i < params.len() {
             let p = params[i];
             match p {
-                0 => attrs = TextAttributes::default(),
-                1 | 5 => attrs.bold = true, // 5 = blink (deprecated, treated as bold)
-                2 => attrs.hidden = true,
-                3 => attrs.italic = true,
-                4 => attrs.underline = true,
-                7 => attrs.inverse = true,
-                9 => attrs.strikethrough = true,
-                21 | 24 => attrs.underline = false,
-                22 => {
-                    attrs.bold = false;
-                    attrs.hidden = false;
-                }
-                23 => attrs.italic = false,
-                27 => attrs.inverse = false,
-                29 => attrs.strikethrough = false,
-                30..=37 => fg_color = Some(Color::Named((p - 30) as u8)),
+                // 0 resets attributes *and* colours, wherever it appears.
+                0 => actions.push(Action::ResetAttributes),
+                // Attribute codes: bold, italic, underline, inverse, …
+                1..=9 | 21..=29 => actions.push(Action::SetTextAttribute(p)),
+                30..=37 => actions.push(Action::SetForegroundColor(Color::Named((p - 30) as u8))),
                 38 => {
-                    if i + 1 < params.len() {
-                        if params[i + 1] == 5 && i + 2 < params.len() {
-                            fg_color = Some(Color::Palette(params[i + 2] as u8));
-                            i += 2;
-                        } else if params[i + 1] == 2 && i + 4 < params.len() {
-                            fg_color = Some(Color::Rgb {
-                                r: params[i + 2] as u8,
-                                g: params[i + 3] as u8,
-                                b: params[i + 4] as u8,
-                            });
-                            i += 4;
-                        }
+                    if let Some((color, extra)) = Parser::extended_color(params, i) {
+                        actions.push(Action::SetForegroundColor(color));
+                        i += extra;
                     }
                 }
-                39 => fg_color = Some(Color::Named(7)), // default foreground
-                40..=47 => bg_color = Some(Color::Named((p - 40) as u8)),
+                39 => actions.push(Action::SetForegroundColor(Color::Named(7))), // default foreground
+                40..=47 => actions.push(Action::SetBackgroundColor(Color::Named((p - 40) as u8))),
                 48 => {
-                    if i + 1 < params.len() {
-                        if params[i + 1] == 5 && i + 2 < params.len() {
-                            bg_color = Some(Color::Palette(params[i + 2] as u8));
-                            i += 2;
-                        } else if params[i + 1] == 2 && i + 4 < params.len() {
-                            bg_color = Some(Color::Rgb {
-                                r: params[i + 2] as u8,
-                                g: params[i + 3] as u8,
-                                b: params[i + 4] as u8,
-                            });
-                            i += 4;
-                        }
+                    if let Some((color, extra)) = Parser::extended_color(params, i) {
+                        actions.push(Action::SetBackgroundColor(color));
+                        i += extra;
                     }
                 }
-                49 => bg_color = Some(Color::Named(0)), // default background
+                49 => actions.push(Action::SetBackgroundColor(Color::Named(0))), // default background
                 _ => {}
             }
             i += 1;
         }
-
-        actions.push(Action::SetAttributes(attrs));
-        if let Some(color) = fg_color {
-            actions.push(Action::SetForegroundColor(color));
-        }
-        if let Some(color) = bg_color {
-            actions.push(Action::SetBackgroundColor(color));
-        }
-        if params.is_empty() || params == [0] {
-            actions.push(Action::ResetAttributes);
-        }
         actions
+    }
+
+    /// Read an extended colour (`38`/`48`) starting at `start`.
+    ///
+    /// Returns the colour and how many extra parameters it consumed
+    /// (`…;5;N` takes two, `…;2;R;G;B` takes four).
+    fn extended_color(params: &[u16], start: usize) -> Option<(Color, usize)> {
+        match *params.get(start + 1)? {
+            // 256-colour palette.
+            5 => {
+                let index = *params.get(start + 2)?;
+                Some((Color::Palette(index as u8), 2))
+            }
+            // 24-bit RGB.
+            2 => {
+                let r = *params.get(start + 2)?;
+                let g = *params.get(start + 3)?;
+                let b = *params.get(start + 4)?;
+                Some((
+                    Color::Rgb {
+                        r: r as u8,
+                        g: g as u8,
+                        b: b as u8,
+                    },
+                    4,
+                ))
+            }
+            _ => None,
+        }
     }
 
     fn dispatch_decset(params: &[u16]) -> Vec<Action> {
@@ -622,9 +636,56 @@ mod tests {
     fn test_parse_sgr_bold() {
         let mut parser = Parser::new();
         let actions = parser.parse_bytes(b"\x1b[1m");
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::SetAttributes(attrs) if attrs.bold)));
+        assert_eq!(actions, vec![Action::SetTextAttribute(1)]);
+    }
+
+    #[test]
+    fn test_parse_sgr_attributes_are_individual_actions() {
+        // Each attribute travels on its own so the engine can apply it to the
+        // attributes it already has.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[3m"),
+            vec![Action::SetTextAttribute(3)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[4m"),
+            vec![Action::SetTextAttribute(4)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[7m"),
+            vec![Action::SetTextAttribute(7)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[22m"),
+            vec![Action::SetTextAttribute(22)]
+        );
+    }
+
+    #[test]
+    fn test_parse_sgr_colour_does_not_touch_attributes() {
+        // Regression: a colour sequence used to emit a full attribute set,
+        // which wiped bold/italic set by an earlier sequence.
+        let mut parser = Parser::new();
+        let actions = parser.parse_bytes(b"\x1b[38;5;2;49m");
+        assert_eq!(
+            actions,
+            vec![
+                Action::SetForegroundColor(Color::Palette(2)),
+                Action::SetBackgroundColor(Color::Named(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_sgr_reset_in_the_middle() {
+        // SGR 0 resets attributes and colours wherever it appears.
+        let mut parser = Parser::new();
+        let actions = parser.parse_bytes(b"\x1b[0;1m");
+        assert_eq!(
+            actions,
+            vec![Action::ResetAttributes, Action::SetTextAttribute(1)]
+        );
     }
 
     #[test]
@@ -664,6 +725,33 @@ mod tests {
         let mut parser = Parser::new();
         let actions = parser.parse_bytes(b"\x1b[5;10H");
         assert_eq!(actions, vec![Action::CursorPosition(4, 9)]);
+    }
+
+    #[test]
+    fn test_parse_vertical_position_absolute() {
+        // VPA moves to a row and keeps the column; htop steps down the screen
+        // with `CR` + `ESC [ <row> d` instead of a full CUP.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[10d"),
+            vec![Action::CursorToRow(9)]
+        );
+        assert_eq!(parser.parse_bytes(b"\x1b[2d"), vec![Action::CursorToRow(1)]);
+        // A bare `ESC [ d` defaults to the first row.
+        assert_eq!(parser.parse_bytes(b"\x1b[d"), vec![Action::CursorToRow(0)]);
+    }
+
+    #[test]
+    fn test_parse_erase_character() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[24X"),
+            vec![Action::EraseChars(24)]
+        );
+        // A bare `ESC [ X` erases a single character.
+        assert_eq!(parser.parse_bytes(b"\x1b[X"), vec![Action::EraseChars(1)]);
+        // An explicit zero erases nothing.
+        assert_eq!(parser.parse_bytes(b"\x1b[0X"), vec![Action::EraseChars(0)]);
     }
 
     #[test]

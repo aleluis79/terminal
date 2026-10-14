@@ -213,6 +213,18 @@ impl ScreenBuffer {
         }
     }
 
+    /// Erase `n` characters starting at the cursor, without moving it (ECH).
+    pub fn erase_chars(&mut self, row: usize, col: usize, n: usize) {
+        if row >= self.grid.rows {
+            return;
+        }
+        let cols = self.grid.cols;
+        let end = col.saturating_add(n).min(cols);
+        for c in col.min(cols)..end {
+            self.grid.cells[row * cols + c] = Cell::default();
+        }
+    }
+
     /// Erase part of the display (ED).
     ///
     /// `mode`: `0` = cursor→end, `1` = start→cursor (inclusive), `2` = whole screen.
@@ -630,5 +642,49 @@ mod tests {
             buf.save_to_scrollback();
         }
         assert!(buf.scrollback_len() <= 5);
+    }
+
+    #[test]
+    fn test_erase_chars() {
+        let mut buf = ScreenBuffer::new(2, 10);
+        for (col, c) in "abcdefgh".chars().enumerate() {
+            buf.grid.set(
+                0,
+                col,
+                Cell {
+                    c,
+                    ..Cell::default()
+                },
+            );
+        }
+
+        buf.erase_chars(0, 2, 3);
+
+        assert_eq!(buf.grid.get(0, 1).c, 'b');
+        assert_eq!(buf.grid.get(0, 2).c, ' ');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(buf.grid.get(0, 4).c, ' ');
+        assert_eq!(buf.grid.get(0, 5).c, 'f');
+    }
+
+    #[test]
+    fn test_erase_chars_clamps_to_line_end() {
+        let mut buf = ScreenBuffer::new(2, 4);
+        buf.grid.set(
+            0,
+            0,
+            Cell {
+                c: 'x',
+                ..Cell::default()
+            },
+        );
+
+        // Asking for more characters than fit must stop at the last column.
+        buf.erase_chars(0, 2, 100);
+        assert_eq!(buf.grid.get(0, 0).c, 'x');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+
+        // Rows outside the screen are ignored instead of panicking.
+        buf.erase_chars(9, 0, 4);
     }
 }

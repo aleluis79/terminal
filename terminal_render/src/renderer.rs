@@ -26,15 +26,20 @@ use wgpu::{
 };
 
 use crate::atlas::{AtlasRegion, GlyphAtlas};
-use crate::color::{unpack_rgba, Color, TerminalPalette};
+use crate::color::{pack_rgba, unpack_rgba, Color, TerminalPalette};
 use crate::font::{FontConfig, FontHandle};
-use crate::glyph::GlyphRenderer;
+use crate::glyph::{GlyphRenderer, RasterGlyph};
+use terminal_core::cell::{CellStyle, Color as TerminalColor};
 
 /// Number of terminal cells the vertex/index buffers are sized for.
 ///
 /// Each cell can produce up to two quads (background + glyph), plus a handful
 /// for the cursor and selection.
 const MAX_CELLS: usize = 20_000;
+
+/// Fraction of a pixel by which a tiling glyph's ink may fall short of a cell
+/// edge before it is snapped onto it (see [`fit_tiling_glyph`]).
+const TILING_TOLERANCE: f32 = 1.0;
 
 /// Selection state for mouse-driven text selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,10 +81,8 @@ pub enum CursorShape {
 pub struct CellContent {
     /// Character to render.
     pub ch: char,
-    /// Foreground color index.
-    pub fg: u8,
-    /// Background color index.
-    pub bg: u8,
+    /// Colours and text attributes for the cell.
+    pub style: CellStyle,
 }
 
 /// A tab label drawn in the tab bar.
@@ -258,6 +261,87 @@ struct CachedGlyph {
     top: f32,
 }
 
+/// Identity of a rasterized glyph: a character plus the styles that change its
+/// outline, so bold and italic get their own bitmaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    /// The character.
+    ch: char,
+    /// Whether the glyph is drawn emboldened.
+    bold: bool,
+    /// Whether the glyph is drawn slanted.
+    italic: bool,
+}
+
+impl GlyphKey {
+    /// Build the key for a cell.
+    fn of(ch: char, style: &CellStyle) -> Self {
+        Self {
+            ch,
+            bold: style.bold,
+            italic: style.italic,
+        }
+    }
+}
+
+/// Whether `ch` is a line-drawing or block-element character.
+///
+/// These are meant to tile the monospace grid: the ink of a `─` has to reach
+/// the right edge of its cell and that of a `│` the bottom edge, so that
+/// neighbouring cells join into an unbroken line.
+fn is_tiling_char(ch: char) -> bool {
+    matches!(ch, '\u{2500}'..='\u{259F}')
+}
+
+/// Snap a tiling glyph's ink onto the cell edges it is about to meet.
+///
+/// Line-drawing and block characters are meant to tile the monospace grid: the
+/// ink of a `─` has to reach the right edge of its cell and that of a `│` the
+/// bottom edge, so that neighbouring cells join into an unbroken line. Fonts
+/// round the ink box a fraction of a pixel short of the cell, which leaves a
+/// one-pixel seam wherever two cells meet — visible as a dotted border.
+///
+/// Each edge that already sits within [`TILING_TOLERANCE`] of a cell border is
+/// nudged onto it, which stretches the glyph by at most a pixel. Edges further
+/// away are left alone: they belong to a stroke that genuinely stops there (a
+/// corner's stub, a half block, the thin side of a `─`).
+///
+/// Returns `(width, height, left, top)`, where `top` is measured from the
+/// baseline in the coordinate system of [`CachedGlyph`].
+fn fit_tiling_glyph(
+    ch: char,
+    glyph: &RasterGlyph,
+    cell_width: u32,
+    cell_height: u32,
+    ascent: f32,
+) -> (f32, f32, f32, f32) {
+    // Ink box in cell coordinates: x from the left border, y from the top one.
+    let mut left = glyph.left as f32;
+    let mut top = ascent - glyph.top as f32;
+    let mut right = left + glyph.width as f32;
+    let mut bottom = top + glyph.height as f32;
+
+    if is_tiling_char(ch) {
+        let cell_w = cell_width as f32;
+        let cell_h = cell_height as f32;
+
+        if 0.0 < top && top <= TILING_TOLERANCE {
+            top = 0.0;
+        }
+        if 0.0 < cell_h - bottom && cell_h - bottom <= TILING_TOLERANCE {
+            bottom = cell_h;
+        }
+        if 0.0 < left && left <= TILING_TOLERANCE {
+            left = 0.0;
+        }
+        if 0.0 < cell_w - right && cell_w - right <= TILING_TOLERANCE {
+            right = cell_w;
+        }
+    }
+
+    (right - left, bottom - top, left, ascent - top)
+}
+
 /// Main GPU renderer for the terminal.
 pub struct TerminalRenderer {
     /// GPU device (wrapped in Arc for sharing).
@@ -304,7 +388,8 @@ pub struct TerminalRenderer {
     /// Cursor color as normalized RGBA.
     cursor_color: [f32; 4],
     /// Glyph cache: character → atlas entry (or `None` if unrenderable).
-    glyph_cache: HashMap<char, Option<CachedGlyph>>,
+    /// Rasterized glyphs, keyed by character and style.
+    glyph_cache: HashMap<GlyphKey, Option<CachedGlyph>>,
 }
 
 impl TerminalRenderer {
@@ -615,43 +700,58 @@ impl TerminalRenderer {
     fn upload_glyphs(&mut self, content: &RenderContent) {
         for pane in content.panes {
             for cell in pane.cells {
-                self.upload_glyph(cell.ch);
+                self.upload_glyph(GlyphKey::of(cell.ch, &cell.style));
             }
         }
 
         if let Some(bar) = &content.tab_bar {
             for tab in bar.tabs {
                 for ch in tab.title.chars() {
-                    self.upload_glyph(ch);
+                    self.upload_glyph(GlyphKey {
+                        ch,
+                        bold: false,
+                        italic: false,
+                    });
                 }
             }
         }
     }
 
     /// Rasterize and upload a single glyph if it is not cached yet.
-    fn upload_glyph(&mut self, ch: char) {
-        if ch == ' ' || ch == '\0' || self.glyph_cache.contains_key(&ch) {
+    fn upload_glyph(&mut self, key: GlyphKey) {
+        if key.ch == ' ' || key.ch == '\0' || self.glyph_cache.contains_key(&key) {
             return;
         }
 
-        let cached = match self.glyph_renderer.rasterize(&self.font, ch) {
-            Some(glyph) if glyph.width > 0 && glyph.height > 0 => self
-                .atlas
-                .allocate(glyph.width, glyph.height)
-                .map(|region| {
-                    self.atlas.upload(&region, &glyph.data, &self.queue);
-                    CachedGlyph {
-                        region,
-                        width: glyph.width as f32,
-                        height: glyph.height as f32,
-                        left: glyph.left as f32,
-                        top: glyph.top as f32,
-                    }
-                }),
+        let cached = match self
+            .glyph_renderer
+            .rasterize(&self.font, key.ch, key.bold, key.italic)
+        {
+            Some(glyph) if glyph.width > 0 && glyph.height > 0 => {
+                let (width, height, left, top) = fit_tiling_glyph(
+                    key.ch,
+                    &glyph,
+                    self.cell_width,
+                    self.cell_height,
+                    self.ascent,
+                );
+                self.atlas
+                    .allocate(glyph.width, glyph.height, &self.queue)
+                    .map(|region| {
+                        self.atlas.upload(&region, &glyph.data, &self.queue);
+                        CachedGlyph {
+                            region,
+                            width,
+                            height,
+                            left,
+                            top,
+                        }
+                    })
+            }
             _ => None,
         };
 
-        self.glyph_cache.insert(ch, cached);
+        self.glyph_cache.insert(key, cached);
     }
 
     /// Build the vertex and index geometry for the whole frame.
@@ -666,7 +766,7 @@ impl TerminalRenderer {
 
         for pane in content.panes {
             let first_index = indices.len() as u32;
-            self.push_pane(pane, &mut vertices, &mut indices);
+            self.push_pane(pane, content.background_color, &mut vertices, &mut indices);
             batches.push(DrawBatch {
                 first_index,
                 index_count: indices.len() as u32 - first_index,
@@ -693,19 +793,25 @@ impl TerminalRenderer {
         (vertices, indices, batches)
     }
 
-    /// Push one pane: backgrounds, glyphs, selection and cursor.
-    fn push_pane(&self, pane: &GridPane, vertices: &mut Vec<QuadVertex>, indices: &mut Vec<u32>) {
+    /// Push one pane: backgrounds, glyphs, attributes, selection and cursor.
+    ///
+    /// `background` is the terminal background colour, which cells ask for with
+    /// the "default background" attribute and which inverse video swaps into.
+    fn push_pane(
+        &self,
+        pane: &GridPane,
+        background: Color,
+        vertices: &mut Vec<QuadVertex>,
+        indices: &mut Vec<u32>,
+    ) {
         let cell_w = self.cell_width as f32;
         let cell_h = self.cell_height as f32;
-        let baseline = self.ascent;
         let origin_x = pane.rect.x as f32;
         let origin_y = pane.rect.y as f32;
 
         let white = self.atlas.white_region();
-        let white_uv = (
-            (white.uv_left + white.uv_right) * 0.5,
-            (white.uv_bottom + white.uv_top) * 0.5,
-        );
+        let (left, bottom, right, top) = white.uv(self.atlas.dimensions());
+        let white_uv = ((left + right) * 0.5, (bottom + top) * 0.5);
         let solid = (white_uv.0, white_uv.1, white_uv.0, white_uv.1);
 
         let cols = pane.cols;
@@ -715,63 +821,22 @@ impl TerminalRenderer {
                 let Some(cell) = pane.cells.get(idx) else {
                     continue;
                 };
-
-                let cell_x = origin_x + col as f32 * cell_w;
-                let cell_y = origin_y + row as f32 * cell_h;
-
-                // Per-cell background (index 0 means "terminal background").
-                if cell.bg != 0 {
-                    self.push_quad(
-                        vertices,
-                        indices,
-                        cell_x,
-                        cell_y,
-                        cell_w,
-                        cell_h,
-                        solid,
-                        self.color(cell.bg),
-                    );
-                }
-
-                // Glyph.
-                if cell.ch != ' ' && cell.ch != '\0' {
-                    if let Some(Some(glyph)) = self.glyph_cache.get(&cell.ch) {
-                        self.push_quad(
-                            vertices,
-                            indices,
-                            cell_x + glyph.left,
-                            cell_y + baseline - glyph.top,
-                            glyph.width,
-                            glyph.height,
-                            (
-                                glyph.region.uv_left,
-                                glyph.region.uv_bottom,
-                                glyph.region.uv_right,
-                                glyph.region.uv_top,
-                            ),
-                            self.color(cell.fg),
-                        );
-                    }
-                }
+                self.push_cell(
+                    cell,
+                    (
+                        origin_x + col as f32 * cell_w,
+                        origin_y + row as f32 * cell_h,
+                    ),
+                    background,
+                    solid,
+                    vertices,
+                    indices,
+                );
             }
         }
 
         // Selection highlight.
-        if let Some((r1, c1, r2, c2)) = pane.selection.bounds() {
-            let color = [0.25, 0.45, 0.85, 0.35];
-            for row in r1..=r2.min(pane.rows.saturating_sub(1)) {
-                self.push_quad(
-                    vertices,
-                    indices,
-                    origin_x + c1 as f32 * cell_w,
-                    origin_y + row as f32 * cell_h,
-                    (c2 - c1 + 1) as f32 * cell_w,
-                    cell_h,
-                    solid,
-                    color,
-                );
-            }
-        }
+        self.push_selection_highlight(pane, solid, vertices, indices);
 
         // Cursor (shape depends on [`CursorShape`]).
         if pane.cursor_visible {
@@ -803,6 +868,100 @@ impl TerminalRenderer {
         }
     }
 
+    /// Push the quads of a single cell: background, glyph, underline and
+    /// strikethrough.
+    ///
+    /// `origin` is the top-left corner of the cell in pixels and `background`
+    /// the terminal background colour, which cells request with the "default
+    /// background" attribute and which inverse video swaps into.
+    fn push_cell(
+        &self,
+        cell: &CellContent,
+        origin: (f32, f32),
+        background: Color,
+        solid: (f32, f32, f32, f32),
+        vertices: &mut Vec<QuadVertex>,
+        indices: &mut Vec<u32>,
+    ) {
+        let (cell_x, cell_y) = origin;
+        let cell_w = self.cell_width as f32;
+        let cell_h = self.cell_height as f32;
+        let style = cell.style;
+
+        // "Default background" (ANSI 0) means the terminal background.
+        let default_bg = style.bg == TerminalColor::Named(0);
+        let mut fg = self.cell_color(style.fg);
+        let mut bg = if default_bg {
+            background
+        } else {
+            self.cell_color(style.bg)
+        };
+        if style.inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+
+        // Per-cell background. Inverse video always paints one, since it turns
+        // the foreground colour into the background.
+        if style.inverse || !default_bg {
+            self.push_quad(
+                vertices,
+                indices,
+                cell_x,
+                cell_y,
+                cell_w,
+                cell_h,
+                solid,
+                unpack_rgba(bg),
+            );
+        }
+
+        // Glyph. Hidden text is not drawn at all.
+        if !style.hidden && cell.ch != ' ' && cell.ch != '\0' {
+            if let Some(Some(glyph)) = self.glyph_cache.get(&GlyphKey::of(cell.ch, &style)) {
+                let (uv_left, uv_bottom, uv_right, uv_top) =
+                    glyph.region.uv(self.atlas.dimensions());
+                self.push_quad(
+                    vertices,
+                    indices,
+                    cell_x + glyph.left,
+                    cell_y + self.ascent - glyph.top,
+                    glyph.width,
+                    glyph.height,
+                    (uv_left, uv_bottom, uv_right, uv_top),
+                    unpack_rgba(fg),
+                );
+            }
+        }
+
+        // Underline and strikethrough are quads under the glyph, so they work
+        // with any font.
+        let rule = (cell_h * 0.08).max(1.0);
+        if style.underline {
+            self.push_quad(
+                vertices,
+                indices,
+                cell_x,
+                cell_y + cell_h - rule,
+                cell_w,
+                rule,
+                solid,
+                unpack_rgba(fg),
+            );
+        }
+        if style.strikethrough {
+            self.push_quad(
+                vertices,
+                indices,
+                cell_x,
+                cell_y + cell_h * 0.55,
+                cell_w,
+                rule,
+                solid,
+                unpack_rgba(fg),
+            );
+        }
+    }
+
     /// Push the tab bar (background, tab buttons and titles) above the grid.
     fn push_tab_bar(
         &self,
@@ -815,11 +974,13 @@ impl TerminalRenderer {
         let total_w = bar_width as f32;
 
         let white = self.atlas.white_region();
-        let uv = (
-            (white.uv_left + white.uv_right) * 0.5,
-            (white.uv_bottom + white.uv_top) * 0.5,
+        let uv = white.uv(self.atlas.dimensions());
+        let solid = (
+            (uv.0 + uv.2) * 0.5,
+            (uv.1 + uv.3) * 0.5,
+            (uv.0 + uv.2) * 0.5,
+            (uv.1 + uv.3) * 0.5,
         );
-        let solid = (uv.0, uv.1, uv.0, uv.1);
 
         // Bar background.
         self.push_quad(
@@ -853,7 +1014,14 @@ impl TerminalRenderer {
             let text_w = tab.title.chars().count() as f32 * title_w;
             let mut pen = x + (w - text_w) * 0.5;
             for ch in tab.title.chars() {
-                if let Some(Some(glyph)) = self.glyph_cache.get(&ch) {
+                let key = GlyphKey {
+                    ch,
+                    bold: false,
+                    italic: false,
+                };
+                if let Some(Some(glyph)) = self.glyph_cache.get(&key) {
+                    let (uv_left, uv_bottom, uv_right, uv_top) =
+                        glyph.region.uv(self.atlas.dimensions());
                     self.push_quad(
                         vertices,
                         indices,
@@ -861,17 +1029,62 @@ impl TerminalRenderer {
                         baseline - glyph.top,
                         glyph.width,
                         glyph.height,
-                        (
-                            glyph.region.uv_left,
-                            glyph.region.uv_bottom,
-                            glyph.region.uv_right,
-                            glyph.region.uv_top,
-                        ),
+                        (uv_left, uv_bottom, uv_right, uv_top),
                         fg,
                     );
                 }
                 pen += title_w;
             }
+        }
+    }
+
+    /// Push the selection highlight quads for one pane.
+    ///
+    /// The highlight is linear, matching the text that Ctrl+Shift+C copies:
+    /// only the first and last row are partial, the rows in between are
+    /// highlighted from edge to edge.
+    fn push_selection_highlight(
+        &self,
+        pane: &GridPane,
+        solid: (f32, f32, f32, f32),
+        vertices: &mut Vec<QuadVertex>,
+        indices: &mut Vec<u32>,
+    ) {
+        let (Some(start), Some(end)) = (pane.selection.start, pane.selection.end) else {
+            return;
+        };
+
+        // Order the ends in reading order, so dragging upwards highlights the
+        // same cells as dragging downwards.
+        let ((r1, c1), (r2, c2)) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        let cell_w = self.cell_width as f32;
+        let cell_h = self.cell_height as f32;
+        let origin_x = pane.rect.x as f32;
+        let origin_y = pane.rect.y as f32;
+        let last_col = pane.cols.saturating_sub(1);
+        let color = [0.25, 0.45, 0.85, 0.35];
+
+        for row in r1..=r2.min(pane.rows.saturating_sub(1)) {
+            let first = if row == r1 { c1 } else { 0 };
+            let last = (if row == r2 { c2 } else { last_col }).min(last_col);
+            if last < first {
+                continue;
+            }
+            self.push_quad(
+                vertices,
+                indices,
+                origin_x + first as f32 * cell_w,
+                origin_y + row as f32 * cell_h,
+                (last - first + 1) as f32 * cell_w,
+                cell_h,
+                solid,
+                color,
+            );
         }
     }
 
@@ -941,6 +1154,19 @@ impl TerminalRenderer {
         });
 
         indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    /// Resolve a cell colour to a packed RGBA value.
+    ///
+    /// Palette indices (both the 16 ANSI ones and the 256-colour table) are
+    /// looked up in the palette; 24-bit RGB is used as-is.
+    fn cell_color(&self, color: TerminalColor) -> Color {
+        match color {
+            TerminalColor::Named(index) | TerminalColor::Palette(index) => {
+                self.palette_array[index as usize]
+            }
+            TerminalColor::Rgb { r, g, b } => pack_rgba(r, g, b, 0xFF),
+        }
     }
 
     /// Look up a palette color as normalized RGBA.
@@ -1021,5 +1247,114 @@ mod tests {
     fn test_cursor_shape_default() {
         let shape = CursorShape::default();
         assert_eq!(shape, CursorShape::Block);
+    }
+
+    /// Build a raster glyph with the given ink box (no bitmap data needed).
+    fn glyph(width: u32, height: u32, left: i32, top: i32) -> RasterGlyph {
+        RasterGlyph {
+            glyph_id: 1,
+            width,
+            height,
+            left,
+            top,
+            data: Vec::new(),
+        }
+    }
+
+    /// Assert a fitted glyph box equals the expected one (within a pixel).
+    fn assert_box(actual: (f32, f32, f32, f32), expected: (f32, f32, f32, f32)) {
+        let actual = [actual.0, actual.1, actual.2, actual.3];
+        let expected = [expected.0, expected.1, expected.2, expected.3];
+        let labels = ["width", "height", "left", "top"];
+        for (i, label) in labels.iter().enumerate() {
+            assert!(
+                (actual[i] - expected[i]).abs() < 0.01,
+                "{label}: expected {}, got {}",
+                expected[i],
+                actual[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fit_tiling_glyph_vertical_line_fills_cell_height() {
+        // Regression: Hack Nerd Font draws `│` 21px tall in a 22px cell, which
+        // left a one-pixel seam between rows (box borders looked dotted).
+        // Real ink box: 5x21, left=3, top=17, cell 12x22, ascent 17.3.
+        assert_box(
+            fit_tiling_glyph('│', &glyph(5, 21, 3, 17), 12, 22, 17.3),
+            (5.0, 22.0, 3.0, 17.3),
+        );
+    }
+
+    #[test]
+    fn test_fit_tiling_glyph_corner_reaches_next_row() {
+        // `┌`'s stub stops a fraction of a pixel above the cell bottom; it must
+        // reach it to join the `│` in the row below.
+        assert_box(
+            fit_tiling_glyph('┌', &glyph(10, 13, 3, 9), 12, 22, 17.3),
+            (10.0, 13.7, 3.0, 9.0),
+        );
+        // `┴`'s stub stops just below the cell top; it must reach it.
+        assert_box(
+            fit_tiling_glyph('┴', &glyph(15, 13, -2, 17), 12, 22, 17.3),
+            (15.0, 13.3, -2.0, 17.3),
+        );
+    }
+
+    #[test]
+    fn test_fit_tiling_glyph_half_blocks_reach_their_cell_edge() {
+        // The upper half block starts at the cell top, the lower one ends at
+        // its bottom, so stacked halves leave no seam.
+        assert_box(
+            fit_tiling_glyph('▀', &glyph(14, 11, -1, 17), 12, 22, 17.3),
+            (14.0, 11.3, -1.0, 17.3),
+        );
+        assert_box(
+            fit_tiling_glyph('▄', &glyph(14, 11, -1, 7), 12, 22, 17.3),
+            (14.0, 11.7, -1.0, 7.0),
+        );
+    }
+
+    #[test]
+    fn test_fit_tiling_glyph_horizontal_line_keeps_thickness() {
+        // `─` already overlaps its neighbours horizontally (15px in a 12px
+        // cell); stretching it would only make the line thicker.
+        assert_box(
+            fit_tiling_glyph('─', &glyph(15, 3, -2, 8), 12, 22, 17.3),
+            (15.0, 3.0, -2.0, 8.0),
+        );
+    }
+
+    #[test]
+    fn test_fit_tiling_glyph_leaves_far_edges_alone() {
+        // A stroke that stops well short of an edge is a design choice (a
+        // shorter line) and must keep its size.
+        assert_box(
+            fit_tiling_glyph('│', &glyph(5, 20, 3, 17), 12, 22, 17.3),
+            (5.0, 20.3, 3.0, 17.3),
+        );
+        assert_box(
+            fit_tiling_glyph('┐', &glyph(10, 13, -2, 9), 12, 22, 17.3),
+            (10.0, 13.7, -2.0, 9.0),
+        );
+    }
+
+    #[test]
+    fn test_fit_tiling_glyph_ignores_ordinary_characters() {
+        assert_box(
+            fit_tiling_glyph('M', &glyph(13, 14, -1, 14), 12, 22, 17.3),
+            (13.0, 14.0, -1.0, 14.0),
+        );
+    }
+
+    #[test]
+    fn test_fit_tiling_glyph_widens_a_short_horizontal_line() {
+        // A font whose `─` is one pixel narrower than the cell would leave
+        // horizontal seams; it gets stretched to the cell width.
+        assert_box(
+            fit_tiling_glyph('─', &glyph(11, 3, 0, 8), 12, 22, 17.3),
+            (12.0, 3.0, 0.0, 8.0),
+        );
     }
 }

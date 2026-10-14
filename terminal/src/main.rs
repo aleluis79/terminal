@@ -613,43 +613,57 @@ impl AppInner {
             GuiAction::NavigateDown => self.navigate_panel(NavigateDirection::Down),
             GuiAction::NavigateLeft => self.navigate_panel(NavigateDirection::Left),
             GuiAction::NavigateRight => self.navigate_panel(NavigateDirection::Right),
-            GuiAction::Copy => {
-                // Copy selection to clipboard
-                if let Some(engine) = self.engine() {
-                    let buf = engine.buffer().active();
-                    let selection = self.event_processor.selection();
-                    if let Some((r1, c1, r2, c2)) = selection.bounds() {
-                        let mut text = String::new();
-                        for row in r1..=r2.min(buf.grid.rows - 1) {
-                            if row > r1 {
-                                text.push('\n');
-                            }
-                            for col in c1..=c2.min(buf.grid.cols - 1) {
-                                let cell = buf.grid.get(row, col);
-                                text.push(cell.c);
-                            }
-                        }
-                        self.clipboard.set_text(text);
-                        tracing::debug!(
-                            "Copied to clipboard: {} bytes",
-                            self.clipboard.text().len()
-                        );
-                    }
-                }
-            }
+            GuiAction::Copy => self.copy_selection(),
             GuiAction::Paste => {
                 // Paste clipboard content into the active session.
-                let text = self.clipboard.text().to_string();
-                if !text.is_empty() {
-                    if let Some(session) = self.active_session_mut() {
-                        let _ = session.write_to_shell(text.as_bytes());
-                        tracing::debug!("Pasted {} bytes", text.len());
-                    }
-                }
-                self.needs_redraw = true;
+                let text = self.clipboard.get_text();
+                self.paste_text(&text);
             }
             GuiAction::None => {}
         }
+    }
+
+    /// Text currently selected in the active pane, if any.
+    fn selected_text(&self) -> Option<String> {
+        let engine = self.engine()?;
+        let buffer = engine.buffer().active();
+        self.event_processor.selection().extract_text(&buffer.grid)
+    }
+
+    /// Copy the current selection to the system clipboard.
+    fn copy_selection(&mut self) {
+        let Some(text) = self.selected_text() else {
+            tracing::debug!("Copy requested with no selection");
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+
+        if let Err(err) = self.clipboard.set_text(&text) {
+            tracing::warn!("Could not copy to the system clipboard: {err}");
+        }
+        tracing::debug!("Copied {} bytes to the clipboard", text.len());
+    }
+
+    /// Send `text` to the active session, honouring bracketed paste mode.
+    fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let bracketed = self
+            .engine()
+            .is_some_and(|engine| engine.state().modes.bracketed_paste);
+        let bytes = terminal_core::input::paste_bytes(text, bracketed);
+
+        if let Some(session) = self.active_session_mut() {
+            if let Err(err) = session.write_to_shell(&bytes) {
+                tracing::warn!("Could not paste into the shell: {err}");
+            }
+        }
+        tracing::debug!("Pasted {} bytes", bytes.len());
+        self.needs_redraw = true;
     }
 
     /// Update cursor visibility (blink effect).
@@ -753,8 +767,7 @@ impl AppInner {
                             let cell = buf.grid.get(row, col);
                             terminal_render::renderer::CellContent {
                                 ch: cell.c,
-                                fg: cell.style.fg.as_u8_or_ansi(),
-                                bg: cell.style.bg.as_u8_or_ansi(),
+                                style: cell.style,
                             }
                         })
                     })
@@ -775,12 +788,9 @@ impl AppInner {
                     cursor_visible: id == focused && self.cursor_visible,
                     cols: buf.grid.cols,
                     selection: if selection_pane == Some(id) {
-                        match selection.bounds() {
-                            Some((r1, c1, r2, c2)) => Selection {
-                                start: Some((r1, c1)),
-                                end: Some((r2, c2)),
-                            },
-                            None => Selection::default(),
+                        Selection {
+                            start: selection.start,
+                            end: selection.current,
                         }
                     } else {
                         Selection::default()

@@ -23,14 +23,75 @@ pub struct AtlasRegion {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// UV coordinate (left).
-    pub uv_left: f32,
-    /// UV coordinate (bottom).
-    pub uv_bottom: f32,
-    /// UV coordinate (right).
-    pub uv_right: f32,
-    /// UV coordinate (top).
-    pub uv_top: f32,
+}
+
+impl AtlasRegion {
+    /// Normalized UV coordinates of this region, as
+    /// `(left, bottom, right, top)`.
+    ///
+    /// Computed on demand rather than stored: growing the atlas changes the
+    /// normalized coordinates of every region already handed out.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Atlas coordinates are at most a few thousand pixels"
+    )]
+    pub fn uv(&self, atlas_size: (u32, u32)) -> (f32, f32, f32, f32) {
+        let (atlas_w, atlas_h) = atlas_size;
+        (
+            self.x as f32 / atlas_w as f32,
+            self.y as f32 / atlas_h as f32,
+            (self.x + self.width) as f32 / atlas_w as f32,
+            (self.y + self.height) as f32 / atlas_h as f32,
+        )
+    }
+}
+
+/// Packing cursor: where the next glyph goes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Cursor {
+    /// First free x position in the current row.
+    x: u32,
+    /// Top edge of the current row.
+    y: u32,
+    /// Height of the tallest glyph in the current row.
+    row_height: u32,
+}
+
+impl Cursor {
+    /// Place a `width`x`height` glyph in an atlas of `size`.
+    ///
+    /// Returns the glyph's top-left corner and the updated cursor, or `None`
+    /// when the glyph does not fit at all and the atlas has to grow. Glyphs
+    /// that do not fit in the current row start a new one below it.
+    fn place(&self, width: u32, height: u32, size: (u32, u32)) -> Option<((u32, u32), Self)> {
+        let (atlas_w, atlas_h) = size;
+        if width > atlas_w || height > atlas_h {
+            return None;
+        }
+
+        // Same row, if it is tall enough for this glyph.
+        if self.x + width <= atlas_w && height <= self.row_height {
+            let cursor = Self {
+                x: self.x + width,
+                y: self.y,
+                row_height: self.row_height.max(height),
+            };
+            return Some(((self.x, self.y), cursor));
+        }
+
+        // Otherwise start a new row at the left edge.
+        let y = self.y.max(1) + self.row_height;
+        if y + height <= atlas_h {
+            let cursor = Self {
+                x: width,
+                y,
+                row_height: height,
+            };
+            return Some(((0, y), cursor));
+        }
+
+        None
+    }
 }
 
 /// GPU texture atlas for storing glyph alpha masks.
@@ -46,12 +107,8 @@ pub struct GlyphAtlas {
     width: u32,
     /// Height of the atlas in pixels.
     height: u32,
-    /// Current free x position (scans left to right).
-    free_x: u32,
-    /// Current free y position.
-    free_y: u32,
-    /// Height of the current row.
-    row_height: u32,
+    /// Where the next glyph is packed.
+    cursor: Cursor,
     /// Maximum atlas size before growing.
     max_size: u32,
     /// Device reference for texture creation.
@@ -124,9 +181,7 @@ impl GlyphAtlas {
             texture_view,
             width: size,
             height: size,
-            free_x: 0,
-            free_y: 0,
-            row_height: 0,
+            cursor: Cursor::default(),
             max_size: Self::MAX_SIZE,
             device: Arc::clone(device),
             white_region: AtlasRegion::default(),
@@ -134,7 +189,7 @@ impl GlyphAtlas {
 
         // Reserve a 1x1 opaque texel for solid-color rectangles.
         let region = atlas
-            .allocate(1, 1)
+            .allocate(1, 1, queue)
             .expect("atlas has room for white texel");
         atlas.upload(&region, &[255], queue);
         atlas.white_region = region;
@@ -144,29 +199,28 @@ impl GlyphAtlas {
 
     /// Allocate a region in the atlas for a glyph.
     ///
-    /// Returns the UV coordinates and pixel offset for the glyph.
-    /// If the atlas is full, it grows by doubling in size.
+    /// Glyphs are packed left to right, wrapping to a new row when the current
+    /// one is full. Only when every row is full does the atlas grow.
     ///
     /// # Arguments
     ///
     /// * `width` - Glyph width in pixels.
     /// * `height` - Glyph height in pixels.
-    pub fn allocate(&mut self, width: u32, height: u32) -> Option<AtlasRegion> {
+    /// * `queue` - GPU queue, used when the atlas has to grow.
+    pub fn allocate(&mut self, width: u32, height: u32, queue: &Queue) -> Option<AtlasRegion> {
         let w = width.max(1);
         let h = height.max(1);
 
-        // Try to fit in current row
-        if self.free_x + w <= self.width && h <= self.row_height {
-            return Some(self.allocate_at(self.free_x, self.free_y, w, h));
+        if let Some(((x, y), cursor)) = self.cursor.place(w, h, (self.width, self.height)) {
+            self.cursor = cursor;
+            return Some(AtlasRegion {
+                x,
+                y,
+                width: w,
+                height: h,
+            });
         }
 
-        // Try to start a new row
-        if self.free_x + w <= self.width && self.free_y + h <= self.height {
-            self.free_y = self.free_y.max(1) + self.row_height;
-            return Some(self.allocate_at(self.free_x, self.free_y, w, h));
-        }
-
-        // Atlas needs to grow
         if self.width >= self.max_size {
             eprintln!(
                 "Glyph atlas at maximum size ({:?}x{:?}), skipping glyph",
@@ -175,10 +229,10 @@ impl GlyphAtlas {
             return None;
         }
 
-        self.grow();
+        self.grow(queue);
 
         // Retry allocation after growing
-        self.allocate(w, h)
+        self.allocate(w, h, queue)
     }
 
     /// Upload a glyph alpha mask to the atlas at the given region.
@@ -241,36 +295,11 @@ impl GlyphAtlas {
         self.white_region
     }
 
-    /// Allocate at a specific position.
-    #[expect(clippy::cast_precision_loss)]
-    fn allocate_at(&mut self, x: u32, y: u32, w: u32, h: u32) -> AtlasRegion {
-        let uv_left = x as f32 / self.width as f32;
-        let uv_right = (x + w) as f32 / self.width as f32;
-        let uv_bottom = y as f32 / self.height as f32;
-        let uv_top = (y + h) as f32 / self.height as f32;
-
-        let region = AtlasRegion {
-            x,
-            y,
-            width: w,
-            height: h,
-            uv_left,
-            uv_bottom,
-            uv_right,
-            uv_top,
-        };
-
-        // Update cursor
-        self.free_x += w;
-        if h > self.row_height {
-            self.row_height = h;
-        }
-
-        region
-    }
-
     /// Grow the atlas by doubling its size.
-    fn grow(&mut self) {
+    ///
+    /// The packed glyphs are copied over so the regions already handed out keep
+    /// pointing at their pixels, and the packing cursor is left untouched.
+    fn grow(&mut self, queue: &Queue) {
         let new_size = (self.width * 2).min(self.max_size);
         eprintln!(
             "Growing glyph atlas from {:?}x{:?} to {:?}x{:?}",
@@ -295,6 +324,33 @@ impl GlyphAtlas {
             view_formats: &[],
         });
 
+        // Copy the glyphs packed so far into the new texture.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("glyph_atlas_grow"),
+            });
+        encoder.copy_texture_to_texture(
+            ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            ImageCopyTexture {
+                texture: &new_texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
         // Replace old texture
         self.texture = new_texture;
         self.texture_view = self
@@ -302,9 +358,6 @@ impl GlyphAtlas {
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.width = new_size;
         self.height = new_size;
-        self.free_x = 0;
-        self.free_y = 0;
-        self.row_height = 0;
     }
 }
 
@@ -319,14 +372,54 @@ mod tests {
             y: 0,
             width: 64,
             height: 64,
-            uv_left: 0.0,
-            uv_bottom: 0.0,
-            uv_right: 0.0625,
-            uv_top: 0.0625,
         };
         assert_eq!(region.x, 0);
         assert_eq!(region.width, 64);
-        assert!((region.uv_right - 0.0625).abs() < f32::EPSILON);
+        // 64 pixels of a 1024-wide atlas.
+        let (left, bottom, right, top) = region.uv((1024, 1024));
+        assert!((left - 0.0).abs() < f32::EPSILON);
+        assert!((bottom - 0.0).abs() < f32::EPSILON);
+        assert!((right - 0.0625).abs() < f32::EPSILON);
+        assert!((top - 0.0625).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_atlas_region_uv_follows_the_atlas_size() {
+        // Growing the atlas must change the UVs of a region already handed out,
+        // which is why they are computed on demand instead of cached.
+        let region = AtlasRegion {
+            x: 512,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        assert!((region.uv((1024, 1024)).0 - 0.5).abs() < f32::EPSILON);
+        assert!((region.uv((2048, 2048)).0 - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_cursor_wraps_to_a_new_row() {
+        // Regression: a full row used to grow the atlas — dropping every glyph
+        // already packed — instead of wrapping to the next row.
+        let size = (100, 100);
+        let ((x, y), cursor) = Cursor::default().place(60, 10, size).expect("first glyph");
+        assert_eq!((x, y), (0, 1));
+
+        let ((x2, y2), cursor) = cursor.place(50, 10, size).expect("second glyph");
+        assert_eq!((x2, y2), (0, 11), "a full row must wrap");
+        assert_eq!(cursor.x, 50);
+
+        // Glyphs that fit keep filling the same row.
+        let ((x3, y3), _) = cursor.place(10, 10, size).expect("third glyph");
+        assert_eq!((x3, y3), (50, 11));
+    }
+
+    #[test]
+    fn test_cursor_reports_a_full_atlas() {
+        // Only a genuinely full atlas makes `place` give up.
+        let size = (64, 62);
+        let ((_, _), cursor) = Cursor::default().place(64, 60, size).expect("first glyph");
+        assert!(cursor.place(10, 10, size).is_none());
     }
 
     #[test]

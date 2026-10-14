@@ -32,17 +32,6 @@ impl Color {
             Color::Rgb { r, g, b } => u32::from(b) | (u32::from(g) << 8) | (u32::from(r) << 16),
         }
     }
-
-    /// Get the color index as u8 for ANSI/palette colors, or 0 for RGB.
-    ///
-    /// Returns the index for `Named` and `Palette` variants,
-    /// or `0` (black) for `Rgb` variants (the renderer will use the palette).
-    pub fn as_u8_or_ansi(self) -> u8 {
-        match self {
-            Color::Named(n) | Color::Palette(n) => n,
-            Color::Rgb { .. } => 0,
-        }
-    }
 }
 
 /// Text attributes for a cell.

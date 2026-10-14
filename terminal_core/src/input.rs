@@ -210,9 +210,69 @@ pub fn key_event_to_bytes(event: &KeyEvent) -> Vec<u8> {
     }
 }
 
+/// Encode text for pasting into the terminal.
+///
+/// Line feeds become carriage returns, which is what the terminal line
+/// discipline expects from a paste. When `bracketed` is true the payload is
+/// wrapped in `ESC[200~` … `ESC[201~` so applications can tell a paste apart
+/// from typed input.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+
+    let mut bytes = Vec::with_capacity(normalized.len() + 12);
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(normalized.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_paste_bytes_plain_text_is_unchanged() {
+        assert_eq!(paste_bytes("hello", false), b"hello");
+    }
+
+    #[test]
+    fn test_paste_bytes_newlines_become_carriage_returns() {
+        assert_eq!(paste_bytes("a\nb", false), b"a\rb");
+    }
+
+    #[test]
+    fn test_paste_bytes_crlf_is_not_doubled() {
+        assert_eq!(paste_bytes("a\r\nb", false), b"a\rb");
+    }
+
+    #[test]
+    fn test_paste_bytes_bracketed_is_wrapped() {
+        assert_eq!(paste_bytes("hi", true), b"\x1b[200~hi\x1b[201~");
+    }
+
+    #[test]
+    fn test_paste_bytes_bracketed_multiline() {
+        assert_eq!(
+            paste_bytes("a\nb", true),
+            b"\x1b[200~a\rb\x1b[201~",
+            "bracketed paste must still normalise newlines"
+        );
+    }
+
+    #[test]
+    fn test_paste_bytes_empty() {
+        assert_eq!(paste_bytes("", false), b"");
+        assert_eq!(paste_bytes("", true), b"\x1b[200~\x1b[201~");
+    }
+
+    #[test]
+    fn test_paste_bytes_unicode_is_utf8() {
+        assert_eq!(paste_bytes("ñ", false), vec![0xc3, 0xb1]);
+    }
 
     #[test]
     fn test_char_plain() {

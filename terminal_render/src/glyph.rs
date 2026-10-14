@@ -7,6 +7,12 @@
 
 use crate::font::FontHandle;
 
+/// Emboldening applied to synthesise bold text, as a fraction of the font size.
+const SYNTHETIC_BOLD_STRENGTH: f32 = 0.035;
+
+/// Slant applied to synthesise italic text, in degrees.
+const SYNTHETIC_ITALIC_DEGREES: f32 = 12.0;
+
 /// A rasterized glyph (8-bit alpha mask) ready for atlas upload.
 #[derive(Debug, Clone)]
 pub struct RasterGlyph {
@@ -47,6 +53,11 @@ impl GlyphRenderer {
 
     /// Rasterize a single character into an 8-bit alpha mask.
     ///
+    /// A real bold or italic face is used when the family provides one.
+    /// Otherwise the style is synthesised from the regular outline —
+    /// emboldened or slanted — which is enough for text but fattens fine
+    /// details such as the acute accent of `í`.
+    ///
     /// Returns `None` if the character has no renderable outline in the font
     /// (for example a space, or a glyph missing from the face).
     ///
@@ -54,9 +65,23 @@ impl GlyphRenderer {
     ///
     /// * `font` - The font handle to rasterize with.
     /// * `ch` - The character to rasterize.
-    pub fn rasterize(&mut self, font: &FontHandle, ch: char) -> Option<RasterGlyph> {
+    /// * `bold` - Whether to draw the glyph bold.
+    /// * `italic` - Whether to draw the glyph italic.
+    pub fn rasterize(
+        &mut self,
+        font: &FontHandle,
+        ch: char,
+        bold: bool,
+        italic: bool,
+    ) -> Option<RasterGlyph> {
         // Per-glyph fallback (CL-5): use whichever face actually has the glyph.
-        let face = font.face_for_char(ch)?;
+        // A styled face that does not cover it (a symbol from another family,
+        // say) falls back to the regular face with the style synthesised.
+        let styled = font
+            .styled_face(bold, italic)
+            .filter(|id| font.face_has_glyph(*id, ch));
+        let face = styled.or_else(|| font.face_for_char(ch))?;
+        let synthesise = styled.is_none();
         let size = self.font_size;
         let context = &mut self.context;
 
@@ -68,10 +93,21 @@ impl GlyphRenderer {
             }
 
             let mut scaler = context.builder(font_ref).size(size).hint(true).build();
-            let image = swash::scale::Render::new(&[swash::scale::Source::Outline])
+            let mut render = swash::scale::Render::new(&[swash::scale::Source::Outline]);
+            render
                 .format(swash::zeno::Format::Alpha)
-                .offset(swash::zeno::Vector::new(0.0, 0.0))
-                .render(&mut scaler, glyph_id)?;
+                .offset(swash::zeno::Vector::new(0.0, 0.0));
+            if bold && synthesise {
+                render.embolden(size * SYNTHETIC_BOLD_STRENGTH);
+            }
+            if italic && synthesise {
+                // Shear the outline: the top of the glyph leans to the right.
+                render.transform(Some(swash::zeno::Transform::skew(
+                    swash::zeno::Angle::from_degrees(SYNTHETIC_ITALIC_DEGREES),
+                    swash::zeno::Angle::ZERO,
+                )));
+            }
+            let image = render.render(&mut scaler, glyph_id)?;
 
             let placement = image.placement;
             let mut data = image.data;
@@ -228,7 +264,7 @@ mod tests {
     fn test_rasterize_ascii_glyph() {
         let font = FontHandle::new(&FontConfig::default());
         let mut renderer = GlyphRenderer::new(font.pixel_size());
-        let glyph = renderer.rasterize(&font, 'A');
+        let glyph = renderer.rasterize(&font, 'A', false, false);
         let glyph = glyph.expect("'A' should rasterize to a bitmap");
         assert!(glyph.width > 0);
         assert!(glyph.height > 0);
@@ -238,12 +274,105 @@ mod tests {
     }
 
     #[test]
+    fn test_rasterize_bold_is_heavier() {
+        let font = FontHandle::new(&FontConfig::default());
+        let mut renderer = GlyphRenderer::new(font.pixel_size());
+        let regular = renderer
+            .rasterize(&font, 'H', false, false)
+            .expect("regular 'H'");
+        let bold = renderer
+            .rasterize(&font, 'H', true, false)
+            .expect("bold 'H'");
+
+        let ink = |g: &RasterGlyph| g.data.iter().map(|&p| u32::from(p)).sum::<u32>();
+        assert!(
+            ink(&bold) > ink(&regular),
+            "bold text must cover more pixels ({} vs {})",
+            ink(&bold),
+            ink(&regular)
+        );
+    }
+
+    #[test]
+    fn test_bold_falls_back_to_a_synthesised_outline() {
+        // A family with no bold face of its own must still render bold text, by
+        // fattening the regular outline.
+        let font = FontHandle::new(&FontConfig::default());
+        let no_styles = FontHandle {
+            bold_face_id: None,
+            italic_face_id: None,
+            bold_italic_face_id: None,
+            ..font.clone()
+        };
+        assert_eq!(no_styles.styled_face(true, false), None);
+
+        let mut renderer = GlyphRenderer::new(no_styles.pixel_size());
+        let regular = renderer
+            .rasterize(&no_styles, 'H', false, false)
+            .expect("regular 'H'");
+        let bold = renderer
+            .rasterize(&no_styles, 'H', true, false)
+            .expect("bold 'H'");
+
+        let ink = |g: &RasterGlyph| g.data.iter().map(|&p| u32::from(p)).sum::<u32>();
+        assert!(
+            ink(&bold) > ink(&regular),
+            "synthesised bold must still be heavier ({} vs {})",
+            ink(&bold),
+            ink(&regular)
+        );
+    }
+
+    #[test]
+    fn test_rasterize_italic_leans_right() {
+        let font = FontHandle::new(&FontConfig::default());
+        let mut renderer = GlyphRenderer::new(font.pixel_size());
+        let regular = renderer
+            .rasterize(&font, 'H', false, false)
+            .expect("regular 'H'");
+        let italic = renderer
+            .rasterize(&font, 'H', false, true)
+            .expect("italic 'H'");
+
+        // Slanting pushes the top of the glyph to the right, so the ink's
+        // centre of mass moves that way.
+        let (regular_mass, italic_mass) = (centre_of_mass(&regular), centre_of_mass(&italic));
+        assert!(
+            italic_mass > regular_mass,
+            "italic text must lean right ({italic_mass} vs {regular_mass})"
+        );
+    }
+
+    /// Horizontal centre of mass of a glyph's ink, in pixels.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Glyph masks are a few dozen pixels wide"
+    )]
+    fn centre_of_mass(glyph: &RasterGlyph) -> f32 {
+        if glyph.width == 0 {
+            return 0.0;
+        }
+        let mut moment = 0.0;
+        let mut weight = 0.0;
+        for (i, &px) in glyph.data.iter().enumerate() {
+            let x = (i % glyph.width as usize) as f32;
+            moment += x * f32::from(px);
+            weight += f32::from(px);
+        }
+        if weight == 0.0 {
+            0.0
+        } else {
+            moment / weight
+        }
+    }
+
+    #[test]
     fn test_rasterize_latin1_glyph() {
         // Regression: a non-ASCII letter must rasterize like any other glyph.
         let font = FontHandle::new(&FontConfig::default());
         let mut renderer = GlyphRenderer::new(font.pixel_size());
         let glyph = renderer
-            .rasterize(&font, 'ñ')
+            .rasterize(&font, 'ñ', false, false)
             .expect("'ñ' should rasterize to a bitmap");
         assert!(glyph.width > 0);
         assert!(glyph.height > 0);
@@ -255,7 +384,7 @@ mod tests {
         let font = FontHandle::new(&FontConfig::default());
         let mut renderer = GlyphRenderer::new(font.pixel_size());
         // A space has no outline; swash returns no image (or an empty one).
-        if let Some(glyph) = renderer.rasterize(&font, ' ') {
+        if let Some(glyph) = renderer.rasterize(&font, ' ', false, false) {
             assert!(glyph.data.iter().all(|&px| px == 0));
         }
     }

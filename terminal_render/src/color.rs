@@ -46,7 +46,7 @@ impl Default for TerminalPalette {
                 0x729F_CFFF, // 12: Bright Blue
                 0xAD7F_A8FF, // 13: Bright Magenta
                 0x34E2_E2FF, // 14: Bright Cyan
-                0xFFFF_FF99, // 15: Bright White
+                0xFFFF_FFFF, // 15: Bright White
             ],
             foreground: 0xD3D7_CFFF, // White
             background: 0x281B_2AFF, // Dark purple (Dracula-like)
@@ -69,6 +69,9 @@ impl TerminalPalette {
     }
 
     /// Convert the palette to a 256-element array for quick lookup.
+    ///
+    /// Every entry is RGBA-ordered, matching [`unpack_rgba`] and the standard
+    /// and bright entries of the palette itself.
     pub fn as_array(&self) -> [Color; 256] {
         let mut arr = [0u32; 256];
 
@@ -77,29 +80,22 @@ impl TerminalPalette {
         // Bright colors
         arr[8..16].copy_from_slice(&self.bright);
 
-        // 6x6x6 color cube (16-231) = 216 colors
-        // Values: 0x00, 0x5F, 0x87, 0xAF, 0xD7, 0xFF
-        // Format: (r << 16) | (g << 8) | b (no alpha, consistent with standard colors)
+        // 6x6x6 color cube (16-231), values 0x00, 0x5F, 0x87, 0xAF, 0xD7, 0xFF
         let cube_values: [u8; 6] = [0x00, 0x5F, 0x87, 0xAF, 0xD7, 0xFF];
         let mut idx = 16;
         for &r in &cube_values {
             for &g in &cube_values {
                 for &b in &cube_values {
-                    if idx < 232 {
-                        arr[idx] = u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b);
-                        idx += 1;
-                    }
+                    arr[idx] = pack_rgba(r, g, b, 0xFF);
+                    idx += 1;
                 }
             }
         }
 
-        // Grayscale ramp (232-255)
-        // Format: (a << 24) | (r << 16) | (g << 8) | b
-        for i in 0..24 {
-            let gray_idx = 232 + i;
-            let gray: u8 = 0x08 + (i * 0x0A) as u8;
-            arr[gray_idx] =
-                0xFF00_0000 | u32::from(gray) << 16 | u32::from(gray) << 8 | u32::from(gray);
+        // Grayscale ramp (232-255), from 0x08 to 0xEE in steps of 10.
+        for i in 0..24u8 {
+            let gray = 0x08 + i * 0x0A;
+            arr[232 + i as usize] = pack_rgba(gray, gray, gray, 0xFF);
         }
 
         arr
@@ -197,7 +193,7 @@ mod tests {
         let palette = TerminalPalette::default();
         assert_eq!(palette.get(0), 0x0000_00FF); // Black
         assert_eq!(palette.get(7), 0xD3D7_CFFF); // White
-        assert_eq!(palette.get(15), 0xFFFF_FF99); // Bright White
+        assert_eq!(palette.get(15), 0xFFFF_FFFF); // Bright White
     }
 
     #[test]
@@ -206,12 +202,33 @@ mod tests {
         let arr = palette.as_array();
         assert_eq!(arr.len(), 256);
         assert_eq!(arr[0], 0x0000_00FF); // Black
-        assert_eq!(arr[15], 0xFFFF_FF99); // Bright White
-        assert_eq!(arr[16], 0x0000_0000); // Start of color cube (black)
-                                          // Grayscale: alpha in high byte, RGB in low 3 bytes
-        assert_eq!(arr[232], 0xFF08_0808); // Start of grayscale (gray=0x08)
-                                           // End of grayscale: gray = 0x08 + 23*10 = 0xEE
-        assert_eq!(arr[255], 0xFFEE_EEEE);
+        assert_eq!(arr[15], 0xFFFF_FFFF); // Bright White
+    }
+
+    #[test]
+    fn test_palette_array_extended_colors_are_rgba_ordered() {
+        // Regression: the colour cube and the grayscale ramp used to be packed
+        // in a different byte order than `unpack_rgba` reads, so every colour
+        // above index 15 came out with swapped channels and zero alpha.
+        let palette = TerminalPalette::default();
+        let arr = palette.as_array();
+
+        assert_eq!(arr[16], pack_rgba(0x00, 0x00, 0x00, 0xFF)); // cube black
+        assert_eq!(arr[21], pack_rgba(0x00, 0x00, 0xFF, 0xFF)); // cube blue
+        assert_eq!(arr[196], pack_rgba(0xFF, 0x00, 0x00, 0xFF)); // cube red
+        assert_eq!(arr[231], pack_rgba(0xFF, 0xFF, 0xFF, 0xFF)); // cube white
+
+        assert_eq!(arr[232], pack_rgba(0x08, 0x08, 0x08, 0xFF));
+        assert_eq!(arr[255], pack_rgba(0xEE, 0xEE, 0xEE, 0xFF));
+
+        // Every entry must be opaque, so nothing renders invisible.
+        for (index, &color) in arr.iter().enumerate() {
+            let [_, _, _, a] = unpack_rgba(color);
+            assert!(
+                (a - 1.0).abs() < f32::EPSILON,
+                "colour {index} is not opaque"
+            );
+        }
     }
 
     #[test]

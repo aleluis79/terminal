@@ -53,3 +53,8 @@ winit = { version = "0.30", features = ["serde"] }
 wgpu = "23"
 fontdb = "0.22"
 swash = "0.1"
+
+# Clipboard (MIT OR Apache-2.0)
+# `wayland-data-control` enables native Wayland support; without it arboard
+# only talks to X11, which breaks on pure Wayland sessions.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }

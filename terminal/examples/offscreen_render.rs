@@ -63,20 +63,26 @@ fn main() {
 
     let cols = 8;
     let rows = 2;
+    let plain = terminal_core::cell::CellStyle::default();
     let mut cells = vec![
         CellContent {
             ch: ' ',
-            fg: 7,
-            bg: 0
+            style: plain,
         };
         cols * rows
     ];
+    let mut bright = plain;
+    bright.fg = terminal_core::cell::Color::Named(15);
     for (i, ch) in "Hi!".chars().enumerate() {
         cells[i].ch = ch;
-        cells[i].fg = 15;
+        cells[i].style = bright;
     }
     cells[5].ch = 'X';
-    cells[5].bg = 1; // red background to test bg quads
+    cells[5].style.bg = terminal_core::cell::Color::Named(1); // red background
+    cells[6].ch = 'B';
+    cells[6].style.bold = true; // synthetic bold
+    cells[7].ch = 'U';
+    cells[7].style.underline = true;
 
     let panes = [GridPane {
         cells: &cells,

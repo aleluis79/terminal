@@ -36,6 +36,12 @@ pub struct FontHandle {
     pub db: Database,
     /// The face ID of the loaded font.
     pub face_id: fontdb::ID,
+    /// Bold face of the same family, when it has one.
+    pub bold_face_id: Option<fontdb::ID>,
+    /// Italic face of the same family, when it has one.
+    pub italic_face_id: Option<fontdb::ID>,
+    /// Bold italic face of the same family, when it has one.
+    pub bold_italic_face_id: Option<fontdb::ID>,
     /// The configured font size in points.
     pub size: f32,
 }
@@ -82,10 +88,45 @@ impl FontHandle {
             })
             .expect("No fonts available");
 
+        // Styled faces of the same family, so bold and italic text uses the
+        // real designs instead of a synthesised outline. A face identical to
+        // the regular one is discarded: `query` always returns its closest
+        // match, which would otherwise make every style "found".
+        let family = db
+            .face(face_id)
+            .and_then(|face| face.families.first().map(|(name, _)| name.clone()));
+        let styled = |weight, style| {
+            family.as_ref().and_then(|family| {
+                db.query(&fontdb::Query {
+                    families: &[fontdb::Family::Name(family)],
+                    weight,
+                    stretch: fontdb::Stretch::Normal,
+                    style,
+                })
+            })
+        };
+        let styled = |weight, style| styled(weight, style).filter(|id| *id != face_id);
+
         Self {
+            bold_face_id: styled(fontdb::Weight::BOLD, fontdb::Style::Normal),
+            italic_face_id: styled(fontdb::Weight::NORMAL, fontdb::Style::Italic),
+            bold_italic_face_id: styled(fontdb::Weight::BOLD, fontdb::Style::Italic),
             db,
             face_id,
             size: config.size,
+        }
+    }
+
+    /// Face to use for the given style, when the family provides a real one.
+    ///
+    /// Returns `None` when the style has to be synthesised from the regular
+    /// outline.
+    pub fn styled_face(&self, bold: bool, italic: bool) -> Option<fontdb::ID> {
+        match (bold, italic) {
+            (false, false) => Some(self.face_id),
+            (true, false) => self.bold_face_id,
+            (false, true) => self.italic_face_id,
+            (true, true) => self.bold_italic_face_id,
         }
     }
 
@@ -119,7 +160,7 @@ impl FontHandle {
     }
 
     /// Whether the face `id` maps `ch` to a real glyph.
-    fn face_has_glyph(&self, id: fontdb::ID, ch: char) -> bool {
+    pub fn face_has_glyph(&self, id: fontdb::ID, ch: char) -> bool {
         self.with_face_data_for(id, |data, index| {
             swash::FontRef::from_index(data, index as usize)
                 .is_some_and(|font| font.charmap().map(ch) != 0)
@@ -290,6 +331,36 @@ mod tests {
         // Characters the configured face covers must resolve to that face.
         assert_eq!(font.face_for_char('A'), Some(font.face_id));
         assert_eq!(font.face_for_char(' '), Some(font.face_id));
+    }
+
+    #[test]
+    fn test_styled_faces_share_the_family() {
+        let font = FontHandle::new(&FontConfig::default());
+
+        // The regular style always resolves to the configured face.
+        assert_eq!(font.styled_face(false, false), Some(font.face_id));
+
+        // Any styled face reported must be a *different* face of the same
+        // family: the renderer uses it instead of fattening the regular
+        // outline, which mangles details such as the acute accent of `í`.
+        let family = |id| {
+            font.db
+                .face(id)
+                .and_then(|face| face.families.first().map(|(name, _)| name.clone()))
+        };
+        for (bold, italic) in [(true, false), (false, true), (true, true)] {
+            if let Some(id) = font.styled_face(bold, italic) {
+                assert_ne!(
+                    id, font.face_id,
+                    "a styled face must not be the regular one"
+                );
+                assert_eq!(
+                    family(id),
+                    family(font.face_id),
+                    "a styled face must belong to the same family"
+                );
+            }
+        }
     }
 
     #[test]

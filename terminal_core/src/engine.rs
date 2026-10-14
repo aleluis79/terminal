@@ -78,6 +78,11 @@ impl TerminalEngine {
                 self.state.cursor.col = col.min(cols.saturating_sub(1));
                 self.wrap_pending = false;
             }
+            Action::CursorToRow(row) => {
+                let rows = self.buffer.active().grid.rows;
+                self.state.cursor.row = row.min(rows.saturating_sub(1));
+                self.wrap_pending = false;
+            }
             Action::CursorHome => {
                 self.state.cursor.move_to(0, 0);
                 self.wrap_pending = false;
@@ -91,6 +96,11 @@ impl TerminalEngine {
                 let (row, col) = (self.state.cursor.row, self.state.cursor.col);
                 let buf = self.buffer.active_mut();
                 buf.erase_in_display(row, col, mode);
+            }
+            Action::EraseChars(n) => {
+                let (row, col) = (self.state.cursor.row, self.state.cursor.col);
+                let buf = self.buffer.active_mut();
+                buf.erase_chars(row, col, n);
             }
             Action::InsertLines(n) => {
                 let buf = self.buffer.active_mut();
@@ -120,8 +130,8 @@ impl TerminalEngine {
                 self.state.cursor.col = self.state.cursor.col.saturating_sub(1);
                 self.wrap_pending = false;
             }
-            Action::SetAttributes(attrs) => {
-                self.state.attributes = attrs;
+            Action::SetTextAttribute(param) => {
+                self.state.attributes.apply_sgr(param);
             }
             Action::SetForegroundColor(color) => {
                 self.state.fg_color = color;
@@ -550,6 +560,35 @@ mod tests {
     }
 
     #[test]
+    fn test_sgr_colour_keeps_bold() {
+        // Regression: files_rs (like every TUI) writes `ESC[1m` and then a
+        // colour sequence. The colour must not clear the bold.
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"\x1b[1m\x1b[38;5;2;49m");
+        assert!(engine.state().attributes.bold);
+        assert_eq!(engine.state().fg_color, Color::Palette(2));
+
+        engine.input(b"\x1b[0m");
+        assert!(!engine.state().attributes.bold);
+    }
+
+    #[test]
+    fn test_sgr_attributes_survive_colour_and_turn_off_individually() {
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"\x1b[3;4m");
+        assert!(engine.state().attributes.italic);
+        assert!(engine.state().attributes.underline);
+
+        engine.input(b"\x1b[31m"); // colour only
+        assert!(engine.state().attributes.italic);
+        assert!(engine.state().attributes.underline);
+
+        engine.input(b"\x1b[23m"); // italic off
+        assert!(!engine.state().attributes.italic);
+        assert!(engine.state().attributes.underline);
+    }
+
+    #[test]
     fn test_line_feed() {
         let mut engine = TerminalEngine::new(24, 80);
         engine.input(b"Line1\nLine2");
@@ -782,6 +821,53 @@ mod tests {
     fn test_dimensions() {
         let engine = TerminalEngine::new(24, 80);
         assert_eq!(engine.dimensions(), (24, 80));
+    }
+
+    #[test]
+    fn test_vpa_keeps_column() {
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"\x1b[6;11H"); // row 5, column 10
+        engine.input(b"\x1b[20d"); // VPA: row 19, column unchanged
+
+        assert_eq!(engine.state().cursor.row, 19);
+        assert_eq!(engine.state().cursor.col, 10);
+    }
+
+    #[test]
+    fn test_vpa_clamps_to_screen() {
+        let mut engine = TerminalEngine::new(4, 10);
+        engine.input(b"\x1b[99d");
+        assert_eq!(engine.state().cursor.row, 3);
+    }
+
+    #[test]
+    fn test_ech_erases_without_moving_cursor() {
+        let mut engine = TerminalEngine::new(24, 80);
+        engine.input(b"abcdef");
+        engine.input(b"\x1b[3D"); // back to column 3
+        engine.input(b"\x1b[2X"); // erase two characters
+
+        let buf = engine.buffer().active();
+        assert_eq!(buf.grid.get(0, 2).c, 'c');
+        assert_eq!(buf.grid.get(0, 3).c, ' ');
+        assert_eq!(buf.grid.get(0, 4).c, ' ');
+        assert_eq!(buf.grid.get(0, 5).c, 'f');
+        assert_eq!(engine.state().cursor.col, 3, "ECH must not move the cursor");
+    }
+
+    #[test]
+    fn test_htop_style_row_stepping() {
+        // Regression: htop writes a row, then `CR` + `ESC [ <row> d` (VPA) to
+        // step to the next one. Ignoring the VPA stacked the header and the
+        // process rows on the same line.
+        let mut engine = TerminalEngine::new(6, 10);
+        engine.input(b"\x1b[3dheader\r\x1b[4drow");
+
+        let buf = engine.buffer().active();
+        let row =
+            |r: usize| -> String { (0..buf.grid.cols).map(|c| buf.grid.get(r, c).c).collect() };
+        assert_eq!(row(2).trim_end(), "header");
+        assert_eq!(row(3).trim_end(), "row");
     }
 
     #[test]

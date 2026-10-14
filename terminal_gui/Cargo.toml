@@ -23,5 +23,8 @@ winit = { workspace = true }
 wgpu = { workspace = true }
 pollster = "0.4"
 
+# Clipboard
+arboard = { workspace = true }
+
 [dev-dependencies]
 rstest = { workspace = true }

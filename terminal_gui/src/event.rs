@@ -14,6 +14,7 @@
 use winit::event::{ElementState, KeyEvent, MouseButton};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
+use terminal_core::grid::Grid;
 use terminal_core::input::{ArrowDirection, KeyEvent as TerminalKeyEvent, SpecialKey};
 
 use crate::keymap::{GuiAction, Keymap};
@@ -38,6 +39,42 @@ impl SelectionState {
         let (sr, sc) = self.start?;
         let (cr, cc) = self.current?;
         Some((sr.min(cr), sc.min(cc), sr.max(cr), sc.max(cc)))
+    }
+
+    /// Extract the selected text from `grid`.
+    ///
+    /// The selection is linear: it runs from its anchor to its current cell in
+    /// reading order, taking the whole of every row in between. Trailing blanks
+    /// are trimmed from each line, so copying a line never drags the empty rest
+    /// of the screen along. Returns `None` when no selection is active.
+    pub fn extract_text(&self, grid: &Grid) -> Option<String> {
+        let start = self.start?;
+        let current = self.current?;
+
+        // Order the two ends in reading order: the earlier cell starts the
+        // selection, the later one ends it.
+        let ((r1, c1), (r2, c2)) = if start <= current {
+            (start, current)
+        } else {
+            (current, start)
+        };
+
+        let last_col = grid.cols.saturating_sub(1);
+        let last_row = r2.min(grid.rows.saturating_sub(1));
+
+        let mut lines = Vec::with_capacity(last_row.saturating_sub(r1) + 1);
+        for row in r1..=last_row {
+            let first = if row == r1 { c1 } else { 0 };
+            let last = (if row == r2 { c2 } else { last_col }).min(last_col);
+
+            let mut line = String::new();
+            for col in first..=last {
+                line.push(grid.get(row, col).c);
+            }
+            lines.push(line.trim_end().to_owned());
+        }
+
+        Some(lines.join("\n"))
     }
 }
 
@@ -693,6 +730,101 @@ mod tests {
         };
         assert!(state.is_active());
         assert_eq!(state.bounds(), Some((0, 0, 5, 10)));
+    }
+
+    /// Write `text` into `row`, starting at column 0.
+    fn fill_row(grid: &mut Grid, row: usize, text: &str) {
+        for (col, c) in text.chars().enumerate() {
+            grid.set(
+                row,
+                col,
+                terminal_core::cell::Cell {
+                    c,
+                    style: terminal_core::cell::CellStyle::default(),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_text_without_selection() {
+        let grid = Grid::new(3, 10);
+        assert_eq!(SelectionState::default().extract_text(&grid), None);
+    }
+
+    #[test]
+    fn test_extract_text_single_row() {
+        let mut grid = Grid::new(3, 10);
+        fill_row(&mut grid, 0, "hello");
+
+        let state = SelectionState {
+            start: Some((0, 0)),
+            current: Some((0, 4)),
+        };
+        assert_eq!(state.extract_text(&grid).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_extract_text_trims_trailing_blanks() {
+        let mut grid = Grid::new(3, 10);
+        fill_row(&mut grid, 0, "hello");
+
+        // Selecting past the end of the line must not copy the blank rest.
+        let state = SelectionState {
+            start: Some((0, 0)),
+            current: Some((0, 9)),
+        };
+        assert_eq!(state.extract_text(&grid).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_extract_text_multiline_is_linear() {
+        let mut grid = Grid::new(3, 10);
+        fill_row(&mut grid, 0, "abcdef");
+        fill_row(&mut grid, 1, "ghijkl");
+        fill_row(&mut grid, 2, "mnopqr");
+
+        // From column 2 of the first row to column 1 of the last one: the
+        // middle row is taken whole.
+        let state = SelectionState {
+            start: Some((0, 2)),
+            current: Some((2, 1)),
+        };
+        assert_eq!(
+            state.extract_text(&grid).as_deref(),
+            Some("cdef\nghijkl\nmn")
+        );
+    }
+
+    #[test]
+    fn test_extract_text_reversed_selection_matches() {
+        let mut grid = Grid::new(3, 10);
+        fill_row(&mut grid, 0, "abcdef");
+        fill_row(&mut grid, 1, "ghijkl");
+        fill_row(&mut grid, 2, "mnopqr");
+
+        let state = SelectionState {
+            start: Some((2, 1)),
+            current: Some((0, 2)),
+        };
+        assert_eq!(
+            state.extract_text(&grid).as_deref(),
+            Some("cdef\nghijkl\nmn")
+        );
+    }
+
+    #[test]
+    fn test_extract_text_clamps_to_grid() {
+        let mut grid = Grid::new(2, 4);
+        fill_row(&mut grid, 0, "ab");
+
+        let state = SelectionState {
+            start: Some((0, 0)),
+            current: Some((9, 9)),
+        };
+        // Rows past the grid are ignored instead of panicking; the blank second
+        // row is part of the selection, so it becomes a trailing newline.
+        assert_eq!(state.extract_text(&grid).as_deref(), Some("ab\n"));
     }
 
     #[test]
