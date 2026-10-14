@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+GenericName=Terminal Emulator
+Comment=A fast, spec-driven terminal emulator
+Exec=terminal
+Icon=terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;console;terminal;
+StartupNotify=true
+StartupWMClass=terminal

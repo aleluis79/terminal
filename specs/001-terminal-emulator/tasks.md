@@ -364,6 +364,77 @@
   - Render del panel desplazado con `render_capture`/sonda y comparación con la rejilla; sin cursor mientras hay desplazamiento
   - Hecho cuando: el contenido desplazado es el historial correcto y el cursor no se dibuja
 
+## Fase 13: Control de scroll y pantalla alterna
+
+- [x] **T068: Parser de IND/RI/NEL (RF-55)**
+  - RF: RF-55
+  - `terminal_core/src/parser.rs`: `ESC D` → `Action::Index`, `ESC M` → `Action::ReverseIndex`, `ESC E` → `Action::NextLine` en `parse_escape`; añadir las variantes a `enum Action`
+  - Hecho cuando: `parse_bytes(b"\x1bD")`/`b"\x1bM"`/`b"\x1bE"` devuelven la acción correspondiente
+
+- [x] **T069: `ScreenBuffer::scroll_down` real (RF-55, CL-17)**
+  - RF: RF-55, CL-17
+  - `terminal_core/src/buffer.rs`: sustituir el stub no-op por un desplazamiento hacia abajo que blanquea las `n` filas superiores y conserva las inferiores
+  - Hecho cuando: `scroll_down(1)` inserta una línea en blanco arriba y descarta la última, sin mover el cursor
+
+- [x] **T070: Aplicar IND/RI/NEL en el motor (RF-55, CL-17, CL-18)**
+  - RF: RF-55, CL-17, CL-18
+  - `terminal_core/src/engine.rs`: RI sube el cursor o, en la fila 0, `scroll_down(1)`; IND baja el cursor o, en la última fila, `main_line_feed`/`alternate_line_feed`; NEL es IND + columna 0; reset de la vista al final
+  - Hecho cuando: `ESC M`/`ESC D`/`ESC E` producen el movimiento o el desplazamiento esperado en pantalla principal y alterna
+
+- [x] **T071: Rueda del ratón como flechas en pantalla alterna (RF-56, CL-16)**
+  - RF: RF-56, CL-16
+  - `terminal/src/main.rs`: en `MouseWheel`, si el buffer del panel está en pantalla alterna, enviar flechas arriba/abajo al PTY (vía `input::key_event_to_bytes`) en vez de desplazar el scrollback
+  - Hecho cuando: con la pantalla alterna activa la rueda envía flechas a la aplicación; sin ella, desplaza el historial
+
+- [x] **T072: Verificación end-to-end de `less`/`glow -p` (RF-55, RF-56)**
+  - RF: RF-55, RF-56, CL-17, CL-18
+  - Capturar `less` (bajar y subir) por PTY, reinyectar en `terminal_core` y comparar la rejilla contra `pyte`
+  - Hecho cuando: la rejilla coincide con `pyte` tras subir y bajar en `less`, y `glow AGENTS.md -p` pagina correctamente
+
+## Fase 14: Región de scroll DECSTBM
+
+- [x] **T073: Parser de `ESC[Pt;Pbr` (RF-57)**
+  - RF: RF-57
+  - `terminal_core/src/parser.rs`: `Action::SetScrollRegion(top, bottom)` y el final `r` en `dispatch_csi` (0 = fila por defecto)
+  - Hecho cuando: `ESC[2;4r` → `SetScrollRegion(2,4)` y `ESC[;29r` → `SetScrollRegion(1,29)`
+
+- [x] **T074: Región de scroll en `ScreenBuffer` (RF-57, CL-20, CL-21)**
+  - RF: RF-57, CL-20, CL-21
+  - `terminal_core/src/buffer.rs`: campos `scroll_top`/`scroll_bottom`, `set_scroll_region`, y acotar `scroll_up`/`scroll_down`, `main_line_feed`/`alternate_line_feed`, `insert_lines`/`delete_lines` a la región; scrollback solo con región completa
+  - Hecho cuando: `LF` en el margen inferior desplaza solo la región; `IL`/`DL` fuera de la región no hacen nada
+
+- [x] **T075: Aplicar DECSTBM y RI con región en el motor (RF-57, CL-21, CL-22)**
+  - RF: RF-57, CL-21, CL-22
+  - `terminal_core/src/engine.rs`: validar `SetScrollRegion` (ignorar `Pt >= Pb`), situar el cursor en el margen superior y hacer que RI use el margen superior de la región
+  - Hecho cuando: una región inválida se ignora; RI en el margen superior desplaza la región
+
+- [x] **T076: Verificación end-to-end del TUI de `glow` (RF-57)**
+  - RF: RF-57, CL-20 a CL-22
+  - Capturar `glow -t AGENTS.md` por PTY bajando con flechas, reinyectar en `terminal_core` y comparar la rejilla contra `pyte`
+  - Hecho cuando: la rejilla coincide con `pyte` y el scroll del TUI no desfasa la barra de estado
+
+## Fase 15: Color de la barra de pestañas
+
+- [x] **T077: Barra de pestañas con el fondo del tema (RF-58)**
+  - RF: RF-58
+  - `terminal_render/src/renderer.rs`: `push_tab_bar` pinta la barra y las pestañas inactivas con `palette.background` en vez de `color(0)`
+  - Hecho cuando: la barra usa el color de `colors.primary.background` y la pestaña activa sigue resaltada
+
+- [x] **T078: Pestaña activa redondeada y más oscura (RF-58)**
+  - RF: RF-58
+  - `terminal_render/src/renderer.rs`: atributos `local`/`params` en `QuadVertex` + SDF de esquinas redondeadas en el fragment shader; chip activo con `color(0)` e inset
+  - Hecho cuando: la pestaña activa se dibuja como un chip oscuro con esquinas redondeadas antialiasadas
+
+- [x] **T079: Botón × para cerrar pestañas (RF-59)**
+  - RF: RF-59
+  - `terminal_gui/src/tab_bar.rs` (`close_x`, `close_hit`, layout), `terminal_render/src/renderer.rs` (`TabLabel::close_x`, dibujo de la `×`) y `terminal/src/main.rs` (clic en la `×` → `close_tab_at`)
+  - Hecho cuando: la `×` de una pestaña la cierra (y la última cierra la app); clicar fuera de la `×` enfoca la pestaña
+
+- [x] **T080: Nombre e icono de la aplicación (RF-60)**
+  - RF: RF-60
+  - `terminal/src/main.rs` (`with_name("terminal", "terminal")`), `assets/terminal.desktop`, `assets/terminal.png` y `assets/install-desktop.sh`
+  - Hecho cuando: `WAYLAND_DEBUG=1` muestra `set_app_id("terminal")` y el shell muestra "Terminal" con el icono
+
 ## Resumen
 
 | Fase | Tareas | RFs cubiertos |
@@ -381,5 +452,10 @@
 | 10: Compatibilidad TUI | T046-T062 | RF-44 a RF-51, CL-9 a CL-14 |
 | 11: Divisor de paneles | T063 | RF-52 |
 | 12: Desplazamiento vertical | T064-T067 | RF-53, RF-54, CL-15, CL-16 |
+| 13: Control de scroll y pantalla alterna | T068-T072 | RF-55, RF-56, CL-16 a CL-18 |
+| 14: Región de scroll DECSTBM | T073-T076 | RF-57, CL-20 a CL-22 |
+| 15: Color de la barra de pestañas | T077 | RF-58 |
+| 16: Pestaña activa y botón × | T078-T079 | RF-58, RF-59 |
+| 17: Identidad e icono | T080 | RF-60 |
 
-**Total: 67 tareas**
+**Total: 80 tareas**

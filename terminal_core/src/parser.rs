@@ -51,8 +51,19 @@ pub enum Action {
     InsertLines(usize),
     /// Delete n lines.
     DeleteLines(usize),
+    /// Set the scrolling region (DECSTBM, `ESC [ top ; bottom r`).
+    ///
+    /// `top` and `bottom` are 1-indexed; a `bottom` of `0` means the last row.
+    /// All vertical scrolling is confined to this region (RF-57).
+    SetScrollRegion(usize, usize),
     /// Line feed.
     LineFeed,
+    /// Index (IND, `ESC D`): move down one row, scrolling up at the bottom.
+    Index,
+    /// Reverse Index (RI, `ESC M`): move up one row, scrolling down at the top.
+    ReverseIndex,
+    /// Next Line (NEL, `ESC E`): index and move to column 0.
+    NextLine,
     /// Carriage return.
     CarriageReturn,
     /// Backspace.
@@ -146,6 +157,11 @@ enum ParserState {
 pub struct Parser {
     state: ParserState,
     csi_params: Vec<u16>,
+    /// Whether digits have been seen for the current CSI parameter.
+    ///
+    /// Needed to tell an empty parameter (`ESC [ ; 5 H` → row 1, col 5) apart
+    /// from a value that merely starts with a separator.
+    csi_param_started: bool,
     csi_intermediates: Vec<u8>,
     csi_private: Option<u8>,
     osc_payload: Vec<u8>,
@@ -164,6 +180,7 @@ impl Parser {
         Self {
             state: ParserState::Normal,
             csi_params: Vec::new(),
+            csi_param_started: false,
             csi_intermediates: Vec::new(),
             csi_private: None,
             osc_payload: Vec::new(),
@@ -207,6 +224,7 @@ impl Parser {
     pub fn reset(&mut self) {
         self.state = ParserState::Normal;
         self.csi_params.clear();
+        self.csi_param_started = false;
         self.csi_intermediates.clear();
         self.csi_private = None;
         self.osc_payload.clear();
@@ -298,6 +316,7 @@ impl Parser {
                 // ESC [ = CSI
                 self.state = ParserState::Csi;
                 self.csi_params.clear();
+                self.csi_param_started = false;
                 self.csi_intermediates.clear();
                 self.csi_private = None;
                 Vec::new()
@@ -313,6 +332,9 @@ impl Parser {
                 self.reset();
                 vec![Action::ResetAttributes]
             }
+            b'D' => vec![Action::Index],
+            b'E' => vec![Action::NextLine],
+            b'M' => vec![Action::ReverseIndex],
             b'7' => vec![Action::SaveCursor],
             b'8' => vec![Action::RestoreCursor],
             0x20..=0x2f => {
@@ -342,15 +364,24 @@ impl Parser {
             self.csi_private = Some(byte);
             Vec::new()
         } else if (0x3a..=0x3d).contains(&byte) {
-            // Parameter separators (:, ;, <, =) — push 0 to start new param
-            self.csi_params.push(0);
+            // Parameter separators (:, ;, <, =). An empty parameter (no digits
+            // since the last separator) is recorded as 0; the next digit starts
+            // a fresh parameter instead of extending it, so `ESC [ ; 5 H` keeps
+            // its empty first parameter.
+            if !self.csi_param_started {
+                self.csi_params.push(0);
+            }
+            self.csi_param_started = false;
             Vec::new()
         } else if (0x30..=0x39).contains(&byte) {
             // Digits in parameter (e.g., CSI 1 ; 5 m)
-            if let Some(last) = self.csi_params.last_mut() {
-                *last = *last * 10 + u16::from(byte - b'0');
+            if self.csi_param_started {
+                if let Some(last) = self.csi_params.last_mut() {
+                    *last = *last * 10 + u16::from(byte - b'0');
+                }
             } else {
                 self.csi_params.push(u16::from(byte - b'0'));
+                self.csi_param_started = true;
             }
             Vec::new()
         } else if (0x20..=0x2f).contains(&byte) {
@@ -358,9 +389,14 @@ impl Parser {
             self.csi_intermediates.push(byte);
             Vec::new()
         } else if (0x40..=0x7e).contains(&byte) {
-            // Final byte — dispatch
+            // Final byte — dispatch. A trailing separator leaves an empty last
+            // parameter, which is 0 (`ESC [ 5 ; m` → `5;0`).
+            if !self.csi_param_started && !self.csi_params.is_empty() {
+                self.csi_params.push(0);
+            }
             let actions = self.dispatch_csi(byte);
             self.csi_params.clear();
+            self.csi_param_started = false;
             self.csi_intermediates.clear();
             self.csi_private = None;
             self.state = ParserState::Normal;
@@ -368,6 +404,7 @@ impl Parser {
         } else {
             // Abort CSI
             self.csi_params.clear();
+            self.csi_param_started = false;
             self.csi_intermediates.clear();
             self.csi_private = None;
             Vec::new()
@@ -486,6 +523,16 @@ impl Parser {
             b'M' => vec![Action::DeleteLines(
                 params.first().copied().unwrap_or(1) as usize
             )],
+            // DECSTBM (Set Top and Bottom Margins): `ESC [ top ; bottom r`.
+            // A missing top is 1; a missing bottom means the last row (0).
+            b'r' => {
+                let top = match params.first().copied().unwrap_or(1) {
+                    0 => 1,
+                    n => n,
+                };
+                let bottom = params.get(1).copied().unwrap_or(0);
+                vec![Action::SetScrollRegion(top as usize, bottom as usize)]
+            }
             // DECSET (Set Mode)
             b'h' => Parser::dispatch_decset(&params),
             // DECRESET (Reset Mode)
@@ -984,6 +1031,35 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::EnterAlternateScreen)));
+    }
+
+    #[test]
+    fn test_parse_index_reverse_index_next_line() {
+        // ESC D / ESC M / ESC E are IND / RI / NEL (RF-55). `less` relies on RI
+        // to scroll its pager upwards, which is what `glow -p` runs.
+        let mut parser = Parser::new();
+        assert_eq!(parser.parse_bytes(b"\x1bD"), vec![Action::Index]);
+        assert_eq!(parser.parse_bytes(b"\x1bM"), vec![Action::ReverseIndex]);
+        assert_eq!(parser.parse_bytes(b"\x1bE"), vec![Action::NextLine]);
+    }
+
+    #[test]
+    fn test_parse_set_scroll_region() {
+        // DECSTBM (RF-57): `ESC [ top ; bottom r`. A missing top defaults to 1
+        // and a missing bottom means "last row" (encoded as 0).
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[2;4r"),
+            vec![Action::SetScrollRegion(2, 4)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[;29r"),
+            vec![Action::SetScrollRegion(1, 29)]
+        );
+        assert_eq!(
+            parser.parse_bytes(b"\x1b[r"),
+            vec![Action::SetScrollRegion(1, 0)]
+        );
     }
 
     #[test]

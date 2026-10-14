@@ -22,6 +22,10 @@ pub struct ScreenBuffer {
     pub cursor_row: usize,
     /// Cursor position within this buffer.
     pub cursor_col: usize,
+    /// First row of the scrolling region (DECSTBM), 0-indexed (RF-57).
+    pub scroll_top: usize,
+    /// Last row of the scrolling region (DECSTBM), inclusive (RF-57).
+    pub scroll_bottom: usize,
 }
 
 impl ScreenBuffer {
@@ -31,6 +35,8 @@ impl ScreenBuffer {
             grid: Grid::new(rows, cols),
             cursor_row: 0,
             cursor_col: 0,
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
         }
     }
 
@@ -43,6 +49,20 @@ impl ScreenBuffer {
     pub fn set_cursor(&mut self, row: usize, col: usize) {
         self.cursor_row = row;
         self.cursor_col = col;
+    }
+
+    /// Set the scrolling region (DECSTBM, RF-57).
+    ///
+    /// `top`/`bottom` are 0-indexed and inclusive. An invalid region
+    /// (`top >= bottom`) is ignored, keeping the previous margins (CL-22).
+    pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+        let last = self.grid.rows.saturating_sub(1);
+        let top = top.min(last);
+        let bottom = bottom.min(last);
+        if top < bottom {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+        }
     }
 
     /// Resize the buffer, preserving the content that still fits.
@@ -72,89 +92,137 @@ impl ScreenBuffer {
         self.grid.sanitize_wide();
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+
+        // Keep the scrolling region consistent with the new height: extend it
+        // when it covered the whole screen, otherwise clamp it (RF-57).
+        let last = rows.saturating_sub(1);
+        let was_full = self.scroll_top == 0 && self.scroll_bottom == old_rows.saturating_sub(1);
+        self.scroll_bottom = if was_full {
+            last
+        } else {
+            self.scroll_bottom.min(last)
+        };
+        self.scroll_top = self.scroll_top.min(last);
+        if self.scroll_top >= self.scroll_bottom {
+            self.scroll_top = 0;
+            self.scroll_bottom = last;
+        }
     }
 
-    /// Scroll the active grid up by `n` lines.
+    /// The scrolling region as `(top, bottom)`, inclusive and clamped to the
+    /// current grid (RF-57).
+    fn scroll_region(&self) -> (usize, usize) {
+        let last = self.grid.rows.saturating_sub(1);
+        (self.scroll_top.min(last), self.scroll_bottom.min(last))
+    }
+
+    /// Scroll the active grid up by `n` lines, within the scrolling region.
     ///
     /// Lines are shifted towards the top and the `n` rows revealed at the
-    /// bottom are blanked. This is the primitive behind line feed at the
-    /// bottom of the screen.
+    /// bottom of the region are blanked. This is the primitive behind line feed
+    /// at the bottom margin (RF-57).
     pub fn scroll_up(&mut self, n: usize) {
         if n == 0 {
             return;
         }
-        let rows = self.grid.rows;
         let cols = self.grid.cols;
-        let shift = n.min(rows);
+        let (top, bottom) = self.scroll_region();
+        if top > bottom {
+            return;
+        }
+        let height = bottom - top + 1;
+        let shift = n.min(height);
 
         // Shift the surviving lines up by `shift` rows.
-        if shift < rows {
-            self.grid.cells.copy_within(shift * cols..rows * cols, 0);
+        if shift < height {
+            self.grid
+                .cells
+                .copy_within((top + shift) * cols..(bottom + 1) * cols, top * cols);
         }
-        // Blank the rows revealed at the bottom.
-        self.grid.cells[(rows - shift) * cols..].fill(Cell::default());
+        // Blank the rows revealed at the bottom of the region.
+        self.grid.cells[(bottom + 1 - shift) * cols..(bottom + 1) * cols].fill(Cell::default());
 
         self.cursor_row = self.cursor_row.saturating_sub(shift);
     }
 
-    /// Scroll down (bring back from scrollback).
-    pub fn scroll_down(&mut self) {
-        // In a full implementation, this would bring back lines from scrollback
-        // For now, it's a no-op (scrollback management is in GridBuffer)
+    /// Scroll the active grid down by `n` lines, within the scrolling region.
+    ///
+    /// Lines are shifted towards the bottom and the `n` rows revealed at the
+    /// top of the region are blanked. This is the primitive behind the reverse
+    /// index (`ESC M`) at the top margin (RF-55, RF-57); unlike scrolling up it
+    /// does not touch the scrollback and leaves the cursor where it is.
+    pub fn scroll_down(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let cols = self.grid.cols;
+        let (top, bottom) = self.scroll_region();
+        if top > bottom {
+            return;
+        }
+        let height = bottom - top + 1;
+        let shift = n.min(height);
+
+        // Shift the surviving lines down by `shift` rows.
+        if shift < height {
+            self.grid.cells.copy_within(
+                top * cols..(bottom + 1 - shift) * cols,
+                (top + shift) * cols,
+            );
+        }
+        // Blank the rows revealed at the top of the region.
+        self.grid.cells[top * cols..(top + shift) * cols].fill(Cell::default());
     }
 
-    /// Insert n blank lines at cursor position.
+    /// Insert `n` blank lines at the cursor, within the scrolling region
+    /// (RF-57).
+    ///
+    /// Lines shift towards the region's bottom and the ones pushed past the
+    /// bottom margin are discarded. If the cursor is outside the region the
+    /// sequence is ignored, as in xterm.
     pub fn insert_lines(&mut self, n: usize) {
-        let rows = self.grid.rows;
         let cols = self.grid.cols;
+        let (top, bottom) = self.scroll_region();
         let start = self.cursor_row;
-        let end = (start + n).min(rows);
-
-        if end > rows {
+        if start < top || start > bottom {
             return;
         }
+        let height = bottom - start + 1;
+        let shift = n.min(height);
 
-        // Shift lines down
-        for row in (start..end).rev() {
-            for col in 0..cols {
-                self.grid.cells[(row + 1) * cols + col] = self.grid.cells[row * cols + col];
-            }
+        // Shift lines down.
+        if shift < height {
+            self.grid.cells.copy_within(
+                start * cols..(bottom + 1 - shift) * cols,
+                (start + shift) * cols,
+            );
         }
-
-        // Fill inserted lines with empty cells
-        for row in start..end {
-            for col in 0..cols {
-                self.grid.cells[row * cols + col] = Cell::default();
-            }
-        }
+        // Fill the inserted lines with empty cells.
+        self.grid.cells[start * cols..(start + shift) * cols].fill(Cell::default());
     }
 
-    /// Delete n lines at cursor position.
+    /// Delete `n` lines at the cursor, within the scrolling region (RF-57).
+    ///
+    /// Lines below the deleted ones shift up and the region's bottom rows are
+    /// blanked. If the cursor is outside the region the sequence is ignored.
     pub fn delete_lines(&mut self, n: usize) {
-        let rows = self.grid.rows;
         let cols = self.grid.cols;
+        let (top, bottom) = self.scroll_region();
         let start = self.cursor_row;
-
-        if start >= rows {
+        if start < top || start > bottom {
             return;
         }
+        let height = bottom - start + 1;
+        let shift = n.min(height);
 
-        let end = (start + n).min(rows);
-        let shift = end - start;
-
-        // Shift lines up
-        for row in start..(rows - shift) {
-            for col in 0..cols {
-                self.grid.cells[row * cols + col] = self.grid.cells[(row + shift) * cols + col];
-            }
+        // Shift lines up.
+        if shift < height {
+            self.grid
+                .cells
+                .copy_within((start + shift) * cols..(bottom + 1) * cols, start * cols);
         }
-
-        // Fill bottom lines with empty cells
-        for row in (rows - shift)..rows {
-            for col in 0..cols {
-                self.grid.cells[row * cols + col] = Cell::default();
-            }
-        }
+        // Blank the region's bottom lines.
+        self.grid.cells[(bottom + 1 - shift) * cols..(bottom + 1) * cols].fill(Cell::default());
     }
 
     /// Advance cursor and wrap to next line if needed.
@@ -365,28 +433,40 @@ impl GridBuffer {
         self.scroll_offset = 0;
     }
 
-    /// Handle a line feed on the main buffer, recording the line that leaves
-    /// the top of the screen in the scrollback.
+    /// Handle a line feed on the main buffer.
+    ///
+    /// At the scrolling region's bottom margin the region scrolls up and the
+    /// line that leaves the top of the *screen* becomes history — a partial
+    /// region never feeds the scrollback (RF-57, CL-20). Below the region the
+    /// cursor is clamped to its bottom margin.
     pub fn main_line_feed(&mut self) {
-        if self.main.cursor_row + 1 >= self.main.grid.rows {
-            self.push_scrollback_line();
-            self.main.scroll_up(1);
-            // After scroll, cursor stays at the last row
-            self.main.cursor_row = self.main.grid.rows - 1;
-        } else {
+        let rows = self.main.grid.rows;
+        let bottom = self.main.scroll_bottom.min(rows.saturating_sub(1));
+        if self.main.cursor_row < bottom {
             self.main.cursor_row += 1;
+        } else {
+            if self.main.cursor_row == bottom {
+                if self.main.scroll_top == 0 && bottom == rows.saturating_sub(1) {
+                    self.push_scrollback_line();
+                }
+                self.main.scroll_up(1);
+            }
+            self.main.cursor_row = bottom;
         }
     }
 
     /// Handle a line feed on the alternate buffer.
     pub fn alternate_line_feed(&mut self) {
         if let Some(ref mut alt) = self.alternate {
-            if alt.cursor_row + 1 >= alt.grid.rows {
-                alt.scroll_up(1);
-                // After scroll, cursor stays at the last row
-                alt.cursor_row = alt.grid.rows - 1;
-            } else {
+            let rows = alt.grid.rows;
+            let bottom = alt.scroll_bottom.min(rows.saturating_sub(1));
+            if alt.cursor_row < bottom {
                 alt.cursor_row += 1;
+            } else {
+                if alt.cursor_row == bottom {
+                    alt.scroll_up(1);
+                }
+                alt.cursor_row = bottom;
             }
         }
     }
@@ -829,6 +909,172 @@ mod tests {
     /// Text of a row of cells.
     fn row_text(row: &[Cell]) -> String {
         row.iter().map(|cell| cell.c).collect()
+    }
+
+    #[test]
+    fn test_scroll_down_inserts_blank_line_at_top() {
+        // RF-55 / CL-17: RI at the top of the screen inserts a blank row above
+        // and drops the bottom row.
+        let mut buf = ScreenBuffer::new(3, 2);
+        for (row, c) in ['a', 'b', 'c'].into_iter().enumerate() {
+            buf.grid.set(
+                row,
+                0,
+                Cell {
+                    c,
+                    ..Cell::default()
+                },
+            );
+        }
+
+        buf.scroll_down(1);
+
+        assert_eq!(buf.grid.get(0, 0).c, ' ');
+        assert_eq!(buf.grid.get(1, 0).c, 'a');
+        assert_eq!(buf.grid.get(2, 0).c, 'b');
+        // The cursor is not moved by a scroll.
+        assert_eq!(buf.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn test_scroll_down_more_than_screen_clears() {
+        let mut buf = ScreenBuffer::new(2, 2);
+        buf.grid.set(
+            0,
+            0,
+            Cell {
+                c: 'a',
+                ..Cell::default()
+            },
+        );
+        buf.scroll_down(5);
+        assert_eq!(buf.grid.get(0, 0).c, ' ');
+        assert_eq!(buf.grid.get(1, 0).c, ' ');
+    }
+
+    /// A screen whose first column spells `A`, `B`, `C`, … row by row.
+    fn filled_screen(rows: usize, cols: usize) -> ScreenBuffer {
+        let mut buf = ScreenBuffer::new(rows, cols);
+        for row in 0..rows {
+            buf.grid.set(
+                row,
+                0,
+                Cell {
+                    c: (b'A' + row as u8) as char,
+                    ..Cell::default()
+                },
+            );
+        }
+        buf
+    }
+
+    #[test]
+    fn test_scroll_up_respects_region() {
+        // RF-57 / CL-20: with a region, scrolling up moves only its rows.
+        let mut buf = filled_screen(5, 2);
+        buf.set_scroll_region(1, 3);
+        buf.set_cursor(3, 0); // bottom margin
+        buf.scroll_up(1);
+
+        assert_eq!(buf.grid.get(0, 0).c, 'A'); // above the region
+        assert_eq!(buf.grid.get(1, 0).c, 'C');
+        assert_eq!(buf.grid.get(2, 0).c, 'D');
+        assert_eq!(buf.grid.get(3, 0).c, ' '); // revealed inside the region
+        assert_eq!(buf.grid.get(4, 0).c, 'E'); // below the region
+    }
+
+    #[test]
+    fn test_scroll_down_respects_region() {
+        let mut buf = filled_screen(5, 2);
+        buf.set_scroll_region(1, 3);
+        buf.scroll_down(1);
+
+        assert_eq!(buf.grid.get(0, 0).c, 'A');
+        assert_eq!(buf.grid.get(1, 0).c, ' ');
+        assert_eq!(buf.grid.get(2, 0).c, 'B');
+        assert_eq!(buf.grid.get(3, 0).c, 'C');
+        assert_eq!(buf.grid.get(4, 0).c, 'E');
+    }
+
+    #[test]
+    fn test_insert_lines_outside_region_is_ignored() {
+        // RF-57: xterm discards IL/DL when the cursor is outside the margins.
+        let mut buf = filled_screen(5, 2);
+        buf.set_scroll_region(1, 3);
+        buf.set_cursor(0, 0); // above the region
+        buf.insert_lines(1);
+
+        assert_eq!(buf.grid.get(0, 0).c, 'A');
+        assert_eq!(buf.grid.get(1, 0).c, 'B');
+        assert_eq!(buf.grid.get(2, 0).c, 'C');
+    }
+
+    #[test]
+    fn test_insert_and_delete_lines_respect_region() {
+        let mut buf = filled_screen(5, 2);
+        buf.set_scroll_region(1, 3);
+        buf.set_cursor(2, 0); // inside the region
+        buf.insert_lines(1);
+        // Region rows 1..3 (B, C, D) become B, blank, C: D is pushed out.
+        assert_eq!(buf.grid.get(0, 0).c, 'A');
+        assert_eq!(buf.grid.get(1, 0).c, 'B');
+        assert_eq!(buf.grid.get(2, 0).c, ' ');
+        assert_eq!(buf.grid.get(3, 0).c, 'C');
+        assert_eq!(buf.grid.get(4, 0).c, 'E');
+
+        let mut buf = filled_screen(5, 2);
+        buf.set_scroll_region(1, 3);
+        buf.set_cursor(2, 0);
+        buf.delete_lines(1);
+        assert_eq!(buf.grid.get(1, 0).c, 'B');
+        assert_eq!(buf.grid.get(2, 0).c, 'D');
+        assert_eq!(buf.grid.get(3, 0).c, ' ');
+        assert_eq!(buf.grid.get(4, 0).c, 'E');
+    }
+
+    #[test]
+    fn test_main_line_feed_respects_region_and_scrollback() {
+        // RF-57 / CL-20: a line feed at the region's bottom margin scrolls only
+        // the region and never feeds the scrollback.
+        let mut buf = GridBuffer::new(5, 2);
+        for row in 0..5 {
+            buf.main.grid.set(
+                row,
+                0,
+                Cell {
+                    c: (b'A' + row as u8) as char,
+                    ..Cell::default()
+                },
+            );
+        }
+        buf.main.set_scroll_region(1, 3);
+        buf.main.set_cursor(3, 0);
+
+        buf.main_line_feed();
+
+        assert_eq!(buf.main.grid.get(0, 0).c, 'A');
+        assert_eq!(buf.main.grid.get(1, 0).c, 'C');
+        assert_eq!(buf.main.grid.get(2, 0).c, 'D');
+        assert_eq!(buf.main.grid.get(3, 0).c, ' ');
+        assert_eq!(buf.main.grid.get(4, 0).c, 'E');
+        assert_eq!(buf.main.cursor_row, 3);
+        assert_eq!(buf.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn test_resize_updates_full_screen_region() {
+        let mut buf = ScreenBuffer::new(3, 2);
+        assert_eq!((buf.scroll_top, buf.scroll_bottom), (0, 2));
+        buf.resize(5, 2);
+        assert_eq!((buf.scroll_top, buf.scroll_bottom), (0, 4));
+    }
+
+    #[test]
+    fn test_resize_clamps_partial_region() {
+        let mut buf = ScreenBuffer::new(5, 2);
+        buf.set_scroll_region(1, 4);
+        buf.resize(3, 2);
+        assert_eq!((buf.scroll_top, buf.scroll_bottom), (1, 2));
     }
 
     #[test]

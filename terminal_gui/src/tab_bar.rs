@@ -47,12 +47,24 @@ pub struct TabRect {
     pub x: u32,
     /// Width in pixels.
     pub width: u32,
+    /// Left edge of the close button (`×`) area.
+    pub close_x: u32,
 }
 
 impl TabRect {
     /// Whether the pixel `x` falls inside this tab.
     pub fn contains(&self, x: u32) -> bool {
         x >= self.x && x < self.x + self.width
+    }
+
+    /// Whether the pixel `x` falls on this tab's close button (RF-59).
+    pub fn close_hit(&self, x: u32) -> bool {
+        x >= self.close_x && x < self.x + self.width
+    }
+
+    /// Width available to the title, left of the close button.
+    pub fn title_width(&self) -> u32 {
+        self.close_x.saturating_sub(self.x)
     }
 }
 
@@ -87,6 +99,8 @@ impl TabBar {
     const DEFAULT_SPACING: u32 = 4;
     /// Default font size.
     const DEFAULT_FONT_SIZE: u32 = 13;
+    /// Glyph drawn on each tab's close button (RF-59).
+    pub const CLOSE_GLYPH: char = '×';
 
     /// Create a new tab bar with default dimensions.
     pub fn new() -> Self {
@@ -106,19 +120,29 @@ impl TabBar {
     /// Compute the pixel layout of the tab buttons.
     ///
     /// Each tab is as wide as its title (`cell_width` per character) plus
-    /// padding. Tabs that do not fit within `max_width` are dropped. Rendering
-    /// and hit-testing must both use this layout so they stay in sync.
+    /// padding, plus a close button (`×`) on the right (RF-59). Tabs that do
+    /// not fit within `max_width` are dropped. Rendering and hit-testing must
+    /// both use this layout so they stay in sync.
     pub fn layout(&self, titles: &[&str], cell_width: u32, max_width: u32) -> Vec<TabRect> {
         let mut rects = Vec::new();
         let mut x = 0u32;
+        let cell = cell_width.max(1);
+        // The close button is one glyph plus the tab's right padding.
+        let close_w = cell + self.padding;
 
         for (index, title) in titles.iter().enumerate() {
             let chars = u32::try_from(title.chars().count()).unwrap_or(u32::MAX);
-            let width = self.padding * 2 + chars * cell_width.max(1);
+            let title_w = self.padding * 2 + chars * cell;
+            let width = title_w + close_w;
             if x + width > max_width {
                 break;
             }
-            rects.push(TabRect { index, x, width });
+            rects.push(TabRect {
+                index,
+                x,
+                width,
+                close_x: x + title_w,
+            });
             x += width + self.spacing;
         }
 
@@ -184,14 +208,17 @@ mod tests {
         let bar = TabBar::new();
         let titles = ["Terminal", "Terminal 2", "Terminal 3"];
 
-        // "Terminal" = 8 chars: padding*2 (16) + 8 * 10px = 96.
+        // "Terminal" = 8 chars: padding*2 (16) + 8 * 10px = 96 for the title,
+        // plus the close button (10px glyph + 8px padding) = 114.
         let rects = bar.layout(&titles, 10, 1000);
         assert_eq!(rects.len(), 3);
         assert_eq!(rects[0].x, 0);
-        assert_eq!(rects[0].width, 96);
-        // 96 + spacing (4) = 100.
-        assert_eq!(rects[1].x, 100);
-        assert_eq!(rects[1].width, 16 + 10 * 10);
+        assert_eq!(rects[0].width, 114);
+        assert_eq!(rects[0].close_x, 96);
+        // 114 + spacing (4) = 118.
+        assert_eq!(rects[1].x, 118);
+        assert_eq!(rects[1].width, 16 + 10 * 10 + 18);
+        assert_eq!(rects[1].close_x, 118 + 16 + 10 * 10);
 
         assert_eq!(bar.hit_test(50, &rects), Some(0));
         assert_eq!(bar.hit_test(120, &rects), Some(1));
@@ -203,8 +230,8 @@ mod tests {
     fn test_tab_bar_layout_drops_overflowing_tabs() {
         let bar = TabBar::new();
         let titles = ["Terminal", "Terminal 2"];
-        // Only room for the first tab (96px wide).
-        let rects = bar.layout(&titles, 10, 100);
+        // Only room for the first tab (114px wide).
+        let rects = bar.layout(&titles, 10, 120);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].index, 0);
     }
@@ -215,11 +242,28 @@ mod tests {
             index: 0,
             x: 10,
             width: 20,
+            close_x: 24,
         };
         assert!(!rect.contains(9));
         assert!(rect.contains(10));
         assert!(rect.contains(29));
         assert!(!rect.contains(30));
+        // The close button covers the last few pixels only (RF-59).
+        assert!(!rect.close_hit(23));
+        assert!(rect.close_hit(24));
+        assert!(rect.close_hit(29));
+        assert!(!rect.close_hit(30));
+    }
+
+    #[test]
+    fn test_tab_rect_title_width() {
+        let rect = TabRect {
+            index: 0,
+            x: 10,
+            width: 30,
+            close_x: 24,
+        };
+        assert_eq!(rect.title_width(), 14);
     }
 
     #[test]

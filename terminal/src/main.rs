@@ -17,10 +17,17 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
+// Brings `WindowAttributes::with_name` into scope on Linux, which sets the
+// Wayland `app_id` / X11 `WM_CLASS` so the desktop shell can name and icon the
+// window (it matches them against `terminal.desktop`).
+#[cfg(target_os = "linux")]
+use winit::platform::wayland::WindowAttributesExtWayland as _;
+
 use terminal_config::config::{ColorScheme, Config};
 use terminal_config::loader;
 
 use terminal_core::engine::TerminalEngine;
+use terminal_core::input::KeyEvent as TerminalKeyEvent;
 use terminal_core::parser::Action;
 use terminal_core::session::{PollResult, TerminalSession};
 use terminal_core::state::CursorShape as EngineCursorShape;
@@ -33,7 +40,7 @@ use terminal_render::renderer::{
 };
 
 use terminal_gui::clipboard::Clipboard;
-use terminal_gui::event::{EventProcessor, EventResult};
+use terminal_gui::event::{wheel_action, EventProcessor, EventResult, WheelAction};
 use terminal_gui::keymap::GuiAction;
 use terminal_gui::split::{
     NavigateDirection, PanelId, Rect as SplitRect, SplitDirection, SplitLayout,
@@ -44,6 +51,10 @@ use terminal_gui::window::{GpuContext, GpuContextBase};
 
 /// Pixel gap left between split panes.
 const SPLIT_GAP: u32 = 2;
+
+/// Application id / `WM_CLASS`, matched against `terminal.desktop` by the
+/// desktop shell so the window gets a name and icon (RF-60).
+const APP_ID: &str = "terminal";
 
 /// Maximum time a synchronized-output window may hold the frame before it is
 /// presented anyway, so a program that never sends `ESC [ ? 2026 l` cannot
@@ -497,13 +508,16 @@ impl AppInner {
         state: winit::event::ElementState,
         position: (f64, f64),
     ) {
-        // Clicks on the tab bar switch tabs instead of starting a selection.
+        // Clicks on the tab bar switch tabs (or close them) instead of starting
+        // a selection.
         let bar_h = f64::from(self.tab_bar.height());
         if position.1 < bar_h {
             if button == winit::event::MouseButton::Left
                 && state == winit::event::ElementState::Pressed
+                && !self.tab_bar_click(position.0)
             {
-                self.switch_tab_at(position.0);
+                tracing::info!("Last tab closed, exiting");
+                std::process::exit(0);
             }
             return;
         }
@@ -558,23 +572,53 @@ impl AppInner {
             })
     }
 
-    /// Switch to the tab under pixel `x` in the tab bar, if any.
+    /// Handle a click on the tab bar (RF-59).
+    ///
+    /// The close button (`×`) closes the clicked tab; anywhere else switches to
+    /// it. Returns `false` when closing the last tab should exit the app.
     #[expect(
         clippy::cast_sign_loss,
         reason = "Pixel coordinates are clamped to be non-negative"
     )]
-    fn switch_tab_at(&mut self, x: f64) {
+    fn tab_bar_click(&mut self, x: f64) -> bool {
         let (cell_w, _cell_h) = self.cell_size();
         let titles: Vec<&str> = self.tab_manager.tabs().iter().map(Tab::title).collect();
         let max_width = cell_w * self.grid_size().1 as u32;
         let rects = self.tab_bar.layout(&titles, cell_w, max_width);
 
         let x = x.max(0.0) as u32;
-        if let Some(idx) = self.tab_bar.hit_test(x, &rects) {
-            self.tab_manager.switch_to(idx);
-            tracing::info!("Switched to tab {idx}");
+        let Some(rect) = rects.iter().find(|r| r.contains(x)) else {
+            return true;
+        };
+
+        if rect.close_hit(x) {
             self.needs_redraw = true;
+            return self.close_tab_at(rect.index);
         }
+
+        self.tab_manager.switch_to(rect.index);
+        self.clear_selection();
+        tracing::info!("Switched to tab {}", rect.index);
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Close the tab at `idx`, its panes and sessions (RF-59).
+    ///
+    /// Returns `false` when no tabs remain (the app should exit, CL-7).
+    fn close_tab_at(&mut self, idx: usize) -> bool {
+        if idx == self.tab_manager.active_idx().unwrap_or(usize::MAX) {
+            return self.close_active_tab();
+        }
+        let Some(id) = self.tab_manager.get_tab(idx).map(Tab::id) else {
+            return true;
+        };
+        // Dropping the sessions closes their PTYs.
+        self.tabs.remove(&id);
+        self.tab_manager.close_tab(id);
+        self.clear_selection();
+        tracing::info!("Closed tab {idx}");
+        true
     }
 
     /// Process a mouse cursor move (for drag selection).
@@ -694,6 +738,46 @@ impl AppInner {
             GuiAction::ScrollBottom => self.scroll_view_to_edge(false),
             GuiAction::None => {}
         }
+    }
+
+    /// Handle a mouse-wheel delta on the pane under the pointer (RF-53, RF-56).
+    ///
+    /// On the main screen it moves the scrollback view; on the alternate screen
+    /// (where a pager such as `less`/`glow -p` runs) it forwards cursor keys to
+    /// the program instead.
+    fn wheel_scroll(&mut self, lines: i32) {
+        if lines == 0 {
+            return;
+        }
+        let Some(session) = self.scroll_target_session() else {
+            return;
+        };
+        match wheel_action(session.buffer().is_alternate_screen_active(), lines) {
+            WheelAction::Scroll(n) => {
+                let buffer = session.engine_mut().buffer_mut();
+                if n > 0 {
+                    buffer.scroll_back(n.unsigned_abs() as usize);
+                } else {
+                    buffer.scroll_forward(n.unsigned_abs() as usize);
+                }
+            }
+            WheelAction::Arrows { direction, count } => {
+                let arrow = TerminalKeyEvent::Arrow {
+                    direction,
+                    ctrl: false,
+                    alt: false,
+                };
+                let bytes = terminal_core::input::key_event_to_bytes(&arrow);
+                let mut seq = Vec::with_capacity(bytes.len() * count);
+                for _ in 0..count {
+                    seq.extend_from_slice(&bytes);
+                }
+                if let Err(err) = session.write_to_shell(&seq) {
+                    tracing::warn!("Could not send wheel scroll to the shell: {err}");
+                }
+            }
+        }
+        self.needs_redraw = true;
     }
 
     /// Scroll the view of the pane under the cursor (or the focused pane).
@@ -864,6 +948,7 @@ impl AppInner {
                     x: rect.x,
                     width: rect.width,
                     active: rect.index == active_idx,
+                    close_x: rect.close_x,
                 })
             })
             .collect();
@@ -1049,6 +1134,12 @@ impl ApplicationHandler for App {
             .with_transparent(transparent)
             .with_maximized(maximized);
 
+        // Name the window as an application, not just with a title: the Wayland
+        // `app_id` / X11 `WM_CLASS` is what the desktop shell shows in the task
+        // bar and uses to look up `terminal.desktop` for the icon.
+        #[cfg(target_os = "linux")]
+        let window_attrs = window_attrs.with_name(APP_ID, APP_ID);
+
         let window = match event_loop.create_window(window_attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -1169,8 +1260,9 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y / f64::from(cell_h.max(1)),
                 };
-                // Wheel up (positive) scrolls back into the history (RF-53).
-                state.scroll_view(lines.round() as i32);
+                // Wheel up (positive) scrolls back into the history (RF-53);
+                // on the alternate screen it becomes cursor keys (RF-56).
+                state.wheel_scroll(lines.round() as i32);
             }
             WindowEvent::Resized(size) => {
                 let mut state = self.state.lock().unwrap();

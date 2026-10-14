@@ -111,6 +111,45 @@ pub struct TerminalInput {
     pub event: TerminalKeyEvent,
 }
 
+/// What a mouse-wheel event should do on the pane under the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelAction {
+    /// Scroll the scrollback view by this many lines (positive = back in time).
+    Scroll(i32),
+    /// Send cursor-key presses to the program, which is what pagers such as
+    /// `less` (and therefore `glow -p`) expect on the alternate screen (RF-56).
+    Arrows {
+        /// Arrow direction to send.
+        direction: ArrowDirection,
+        /// How many times to repeat the key.
+        count: usize,
+    },
+}
+
+/// Decide what a wheel delta should do, given whether the pane is on the
+/// alternate screen (RF-56, CL-16).
+///
+/// On the main screen the wheel moves the scrollback view (RF-53); on the
+/// alternate screen there is no history, so the delta becomes cursor keys for
+/// the program (the classic *alternate scroll*).
+pub fn wheel_action(alternate_screen: bool, lines: i32) -> WheelAction {
+    if lines == 0 {
+        return WheelAction::Scroll(0);
+    }
+    if alternate_screen {
+        WheelAction::Arrows {
+            direction: if lines > 0 {
+                ArrowDirection::Up
+            } else {
+                ArrowDirection::Down
+            },
+            count: lines.unsigned_abs() as usize,
+        }
+    } else {
+        WheelAction::Scroll(lines)
+    }
+}
+
 /// Event processor for the terminal GUI.
 ///
 /// Converts winit events to GUI actions and terminal input.
@@ -971,5 +1010,34 @@ mod tests {
         );
         processor.update_selection((9999.0, 9999.0), 10.0, 20.0, 2, 3);
         assert_eq!(processor.selection().bounds(), Some((0, 0, 1, 2)));
+    }
+
+    #[test]
+    fn test_wheel_scrolls_scrollback_on_main_screen() {
+        // RF-53: without the alternate screen the wheel moves the view.
+        assert_eq!(wheel_action(false, 3), WheelAction::Scroll(3));
+        assert_eq!(wheel_action(false, -2), WheelAction::Scroll(-2));
+        assert_eq!(wheel_action(false, 0), WheelAction::Scroll(0));
+    }
+
+    #[test]
+    fn test_wheel_sends_arrows_on_alternate_screen() {
+        // RF-56 / CL-16: `less`/`glow -p` live on the alternate screen and
+        // expect cursor keys, so the wheel must not touch the scrollback.
+        assert_eq!(
+            wheel_action(true, 2),
+            WheelAction::Arrows {
+                direction: ArrowDirection::Up,
+                count: 2
+            }
+        );
+        assert_eq!(
+            wheel_action(true, -1),
+            WheelAction::Arrows {
+                direction: ArrowDirection::Down,
+                count: 1
+            }
+        );
+        assert_eq!(wheel_action(true, 0), WheelAction::Scroll(0));
     }
 }

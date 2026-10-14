@@ -124,6 +124,48 @@ impl TerminalEngine {
                 self.state.cursor.col = 0;
                 self.wrap_pending = false;
             }
+            Action::Index => {
+                self.index_down();
+                self.wrap_pending = false;
+            }
+            Action::NextLine => {
+                self.index_down();
+                self.state.cursor.col = 0;
+                self.wrap_pending = false;
+            }
+            Action::ReverseIndex => {
+                // RI moves the cursor up, or scrolls the region down at its top
+                // margin (RF-55, RF-57). Scrolling down never feeds the
+                // scrollback (CL-17).
+                self.buffer.scroll_to_bottom();
+                let top = self.buffer.active().scroll_top;
+                if self.state.cursor.row == top {
+                    self.buffer.active_mut().scroll_down(1);
+                } else {
+                    self.state.cursor.row = self.state.cursor.row.saturating_sub(1);
+                }
+                self.wrap_pending = false;
+            }
+            Action::SetScrollRegion(top, bottom) => {
+                // DECSTBM (RF-57): an invalid region is ignored (CL-22);
+                // otherwise the margins are set and the cursor homes to the
+                // top one, as in VT100/xterm.
+                let rows = self.buffer.active().grid.rows;
+                if rows == 0 {
+                    return;
+                }
+                let top = top.clamp(1, rows) - 1;
+                let bottom = if bottom == 0 {
+                    rows - 1
+                } else {
+                    bottom.clamp(1, rows) - 1
+                };
+                if top < bottom {
+                    self.buffer.active_mut().set_scroll_region(top, bottom);
+                    self.state.cursor.move_to(top, 0);
+                    self.wrap_pending = false;
+                }
+            }
             Action::CarriageReturn => {
                 self.state.cursor.col = 0;
                 self.wrap_pending = false;
@@ -235,6 +277,23 @@ impl TerminalEngine {
         }
     }
 
+    /// Apply an index (`ESC D`, and the first half of `ESC E`): move the cursor
+    /// down one row, scrolling the screen up when already on the last row.
+    ///
+    /// On the main screen the line that leaves the top becomes scrollback
+    /// (CL-18); on the alternate screen it is discarded. The column is left
+    /// untouched — `NextLine` resets it separately.
+    fn index_down(&mut self) {
+        // Screen modifications return the view to the bottom (RF-54).
+        self.buffer.scroll_to_bottom();
+        if self.buffer.is_alternate_screen_active() {
+            self.buffer.alternate_line_feed();
+        } else {
+            self.buffer.main_line_feed();
+        }
+        self.state.cursor.row = self.buffer.active().cursor().0;
+    }
+
     /// Mirror [`TerminalState::cursor`] into the active screen buffer.
     ///
     /// [`TerminalState::cursor`] is the single source of truth for the engine,
@@ -309,20 +368,21 @@ impl TerminalEngine {
         }
     }
 
-    /// Move to the first column of the next line, scrolling if already at the
-    /// bottom of the screen.
+    /// Move to the first column of the next line, scrolling the region if the
+    /// cursor is already at its bottom margin (RF-57).
     fn wrap_to_next_line(&mut self) {
-        let rows = self.buffer.active().grid.rows;
+        let bottom = self.buffer.active().scroll_bottom;
         self.wrap_pending = false;
         self.state.cursor.col = 0;
-        self.state.cursor.row += 1;
-        if self.state.cursor.row >= rows {
+        if self.state.cursor.row >= bottom {
             if self.buffer.is_alternate_screen_active() {
                 self.buffer.alternate_line_feed();
             } else {
                 self.buffer.main_line_feed();
             }
             self.state.cursor.row = self.buffer.active().cursor().0;
+        } else {
+            self.state.cursor.row += 1;
         }
     }
 
@@ -732,12 +792,158 @@ mod tests {
     }
 
     #[test]
+    fn test_reverse_index_moves_cursor_up() {
+        let mut engine = TerminalEngine::new(4, 4);
+        engine.input(b"\x1b[3;1H"); // row 2
+        engine.input(b"\x1bM");
+        assert_eq!(engine.state().cursor.row, 1);
+        assert_eq!(engine.state().cursor.col, 0);
+    }
+
+    #[test]
+    fn test_reverse_index_at_top_scrolls_down_without_history() {
+        // RF-55 / CL-17: RI on the first row inserts a blank line above and
+        // drops the last row, without feeding the scrollback.
+        let mut engine = TerminalEngine::new(3, 2);
+        engine.input(b"a\r\nb\r\nc");
+        engine.input(b"\x1b[H"); // row 0, col 0
+        engine.input(b"\x1bM");
+
+        let grid = &engine.buffer().active().grid;
+        assert_eq!(grid.get(0, 0).c, ' ');
+        assert_eq!(grid.get(1, 0).c, 'a');
+        assert_eq!(grid.get(2, 0).c, 'b');
+        assert_eq!(engine.buffer().scrollback_len(), 0);
+        assert_eq!(engine.state().cursor.row, 0);
+    }
+
+    #[test]
+    fn test_index_at_bottom_pushes_scrollback() {
+        // RF-55 / CL-18: IND on the last row scrolls the main screen and the
+        // line that leaves the top becomes history.
+        let mut engine = TerminalEngine::new(2, 2);
+        engine.input(b"a\r\nb");
+        engine.input(b"\x1bD");
+
+        let grid = &engine.buffer().active().grid;
+        assert_eq!(grid.get(0, 0).c, 'b');
+        assert_eq!(grid.get(1, 0).c, ' ');
+        assert_eq!(engine.buffer().scrollback_len(), 1);
+        assert_eq!(engine.buffer().scrollback_line(0).unwrap()[0].c, 'a');
+    }
+
+    #[test]
+    fn test_index_keeps_column_and_next_line_resets_it() {
+        let mut engine = TerminalEngine::new(3, 3);
+        engine.input(b"ab"); // row 0, col 2
+        engine.input(b"\x1bD");
+        assert_eq!(
+            (engine.state().cursor.row, engine.state().cursor.col),
+            (1, 2)
+        );
+        engine.input(b"\x1bE");
+        assert_eq!(
+            (engine.state().cursor.row, engine.state().cursor.col),
+            (2, 0)
+        );
+    }
+
+    #[test]
+    fn test_reverse_index_on_alternate_screen_has_no_history() {
+        // CL-18: on the alternate screen RI scrolls the content down and the
+        // last row is discarded; the scrollback is untouched.
+        let mut engine = TerminalEngine::new(2, 2);
+        engine.input(b"\x1b[?1049h");
+        engine.input(b"a\r\nb");
+        engine.input(b"\x1b[H\x1bM");
+
+        let grid = &engine.buffer().active().grid;
+        assert_eq!(grid.get(0, 0).c, ' ');
+        assert_eq!(grid.get(1, 0).c, 'a');
+        assert_eq!(engine.buffer().scrollback_len(), 0);
+    }
+
+    #[test]
+    fn test_set_scroll_region_homes_cursor() {
+        // RF-57: DECSTBM sets the margins and homes the cursor to the top one.
+        let mut engine = TerminalEngine::new(5, 4);
+        engine.input(b"\x1b[2;4r");
+        let buf = engine.buffer().active();
+        assert_eq!((buf.scroll_top, buf.scroll_bottom), (1, 3));
+        assert_eq!(engine.state().cursor.row, 1);
+    }
+
+    #[test]
+    fn test_invalid_scroll_region_is_ignored() {
+        // CL-22: `Pt >= Pb` is ignored, keeping the previous region.
+        let mut engine = TerminalEngine::new(5, 4);
+        engine.input(b"\x1b[2;4r");
+        engine.input(b"\x1b[4;2r");
+        let buf = engine.buffer().active();
+        assert_eq!((buf.scroll_top, buf.scroll_bottom), (1, 3));
+    }
+
+    #[test]
+    fn test_line_feed_scrolls_only_region() {
+        // RF-57 / CL-20: bubbletea paginates like this, leaving the status row
+        // outside the region untouched.
+        let mut engine = TerminalEngine::new(5, 3);
+        engine.input(b"A\r\nB\r\nC\r\nD\r\nE");
+        engine.input(b"\x1b[2;4r"); // region rows 2..4
+        engine.input(b"\x1b[4;1H"); // bottom margin
+        engine.input(b"\n");
+
+        let g = &engine.buffer().active().grid;
+        assert_eq!(g.get(0, 0).c, 'A');
+        assert_eq!(g.get(1, 0).c, 'C');
+        assert_eq!(g.get(2, 0).c, 'D');
+        assert_eq!(g.get(3, 0).c, ' ');
+        assert_eq!(g.get(4, 0).c, 'E');
+        assert_eq!(engine.buffer().scrollback_len(), 0);
+    }
+
+    #[test]
+    fn test_reverse_index_respects_region_top() {
+        // RF-57 / CL-21: RI at the region's top margin scrolls it down.
+        let mut engine = TerminalEngine::new(5, 3);
+        engine.input(b"A\r\nB\r\nC\r\nD\r\nE");
+        engine.input(b"\x1b[2;4r");
+        engine.input(b"\x1b[2;1H"); // top margin
+        engine.input(b"\x1bM");
+
+        let g = &engine.buffer().active().grid;
+        assert_eq!(g.get(0, 0).c, 'A');
+        assert_eq!(g.get(1, 0).c, ' ');
+        assert_eq!(g.get(2, 0).c, 'B');
+        assert_eq!(g.get(3, 0).c, 'C');
+        assert_eq!(g.get(4, 0).c, 'E');
+    }
+
+    #[test]
+    fn test_wrap_at_bottom_margin_scrolls_region() {
+        // RF-57: writing past the region's bottom margin wraps and scrolls the
+        // region, exactly like a line feed at the margin (bubbletea relies on
+        // this for its last line). The four Xs already written scroll up one
+        // row and the fifth wraps onto the bottom margin.
+        let mut engine = TerminalEngine::new(4, 4);
+        engine.input(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD");
+        engine.input(b"\x1b[2;4r"); // region rows 2..4
+        engine.input(b"\x1b[4;1H"); // bottom margin
+        engine.input(b"XXXXX");
+
+        let g = &engine.buffer().active().grid;
+        assert_eq!(g.get(0, 0).c, 'A'); // above the region, untouched
+        assert_eq!(g.get(1, 0).c, 'C');
+        assert_eq!(g.get(2, 0).c, 'X');
+        assert_eq!(g.get(3, 0).c, 'X');
+    }
+
+    #[test]
     fn test_bell_action() {
         let mut engine = TerminalEngine::new(24, 80);
         let gui_actions = engine.input(b"\x07");
         assert!(gui_actions.iter().any(|a| matches!(a, Action::Bell)));
     }
-
     #[test]
     fn test_invalid_bytes_replaced() {
         let mut engine = TerminalEngine::new(24, 80);

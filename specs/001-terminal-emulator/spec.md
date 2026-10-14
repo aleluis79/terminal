@@ -90,6 +90,12 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 
 - RF-53: DONDE el usuario gira la rueda del ratón sobre un panel, o pulsa Shift+PageUp/PageDown/Home/End con el panel enfocado, EL SISTEMA desplaza la vista verticalmente por el historial de scrollback (hasta el límite de RF-15) sin modificar el contenido del buffer.
 - RF-54: MIENTRAS la vista está desplazada hacia el historial, EL SISTEMA no dibuja el cursor; CUANDO el programa escribe nueva salida, EL SISTEMA vuelve al final del buffer.
+- RF-55: DONDE el programa envía Índice (`ESC D`), EL SISTEMA baja el cursor una fila y, si ya está en la última, desplaza el contenido una línea hacia arriba; DONDE envía Índice Inverso (`ESC M`), EL SISTEMA sube el cursor una fila y, si ya está en la primera, desplaza el contenido una línea hacia abajo (insertando una línea en blanco arriba); DONDE envía Next Line (`ESC E`), EL SISTEMA baja una fila y mueve el cursor a la primera columna.
+- RF-56: DONDE el usuario gira la rueda del ratón con la pantalla alterna activa y la aplicación no ha activado el mouse reporting, ENTONCES EL SISTEMA envía a la aplicación las flechas arriba/abajo equivalentes (alternate scroll), en vez de desplazar el scrollback; DONDE la pantalla alterna no está activa, ENTONCES EL SISTEMA aplica RF-53.
+- RF-57: DONDE el programa define una región de scroll (`ESC[Pt;Pbr`), EL SISTEMA limita los desplazamientos verticales (salto de línea, índice, índice inverso, insertar/borrar línea) a las filas `Pt`..`Pb` y deja intactas las filas fuera de la región; DONDE la región es inválida (`Pt >= Pb`), EL SISTEMA ignora la secuencia. La región solo alimenta el scrollback cuando abarca toda la pantalla.
+- RF-58: EL SISTEMA pinta la barra de pestañas y las pestañas inactivas con el color de fondo del tema (`colors.primary.background`); la pestaña activa se dibuja como un chip de color más oscuro (`ansi.black`) con esquinas redondeadas.
+- RF-59: DONDE el usuario hace clic en la `×` de la derecha de una pestaña, EL SISTEMA cierra esa pestaña con sus paneles; DONDE era la última pestaña, EL SISTEMA cierra la aplicación (CL-7).
+- RF-60: EL SISTEMA identifica la ventana con el nombre de aplicación `terminal` (app_id de Wayland / `WM_CLASS` de X11) y provee `assets/terminal.desktop` con `Icon=terminal` e `StartupWMClass=terminal` junto con `assets/terminal.png`, de modo que el entorno de escritorio muestre el nombre y el icono de la aplicación en la barra de tareas.
 
 ## Requisitos no funcionales
 - Rendimiento: renderizado a 60 FPS con 10000 líneas de texto visibles.
@@ -113,7 +119,13 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - CL-13: Secuencia CSI con marcador privado no soportado (`ESC[>…`) — EL SISTEMA la consume completa y no la interpreta como su comando sin prefijo (regresión de RF-11).
 - CL-14: Emoji o símbolo que ninguna fuente del sistema contiene — EL SISTEMA dibuja `.notdef` sin crash.
 - CL-15: La vista se desplaza más allá de la línea más antigua del historial — EL SISTEMA se detiene en la más antigua y no falla.
-- CL-16: Rueda del ratón con la pantalla alterna activa — EL SISTEMA ignora el desplazamiento (la pantalla alterna no tiene historial).
+- CL-16: Rueda del ratón con la pantalla alterna activa y sin mouse reporting — EL SISTEMA envía flechas arriba/abajo a la aplicación (RF-56) y no desplaza el scrollback (la pantalla alterna no tiene historial).
+- CL-17: Índice Inverso (`ESC M`) en la primera fila de la pantalla principal — EL SISTEMA inserta una línea en blanco arriba, desplaza el contenido hacia abajo y descarta la última línea, sin añadir nada al scrollback.
+- CL-18: Índice (`ESC D`) en la última fila de la pantalla activa — EL SISTEMA desplaza el contenido hacia arriba: en la pantalla principal la línea que sale por arriba entra al scrollback y en la alterna se descarta.
+- CL-19: Rueda del ratón en pantalla alterna con mouse reporting activo — EL SISTEMA reenvía el evento al programa (fuera de alcance actual, solo selección de texto; ver "Fuera de alcance").
+- CL-20: Región de scroll que no abarca toda la pantalla y salto de línea en el margen inferior — EL SISTEMA desplaza solo las filas de la región, deja intactas las de arriba/abajo y no alimenta el scrollback.
+- CL-21: Región de scroll e Índice Inverso en el margen superior — EL SISTEMA desplaza la región hacia abajo; con el cursor fuera de la región, solo lo mueve sin desplazar.
+- CL-22: `ESC[Pt;Pbr` con `Pt >= Pb` — EL SISTEMA ignora la secuencia y mantiene la región anterior (pantalla completa).
 
 ## Fuera de alcance
 - Soporte de macOS.
@@ -127,7 +139,7 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - Clipboard nativo (sin modifiers) ni drag-and-drop de archivos.
 
 ## Criterios de finalización
-- Todos los RF (1–54) tienen al menos un test automatizado o verificación manual documentada.
+- Todos los RF (1–60) tienen al menos un test automatizado o verificación manual documentada.
 - `cargo test` pasa en Linux y Windows.
 - Demo manual: abrir, crear pestañas, dividir paneles, copiar/pegar, cambiar configuración, y ejecutar `neofetch` o `htop` correctamente.
 

@@ -452,5 +452,192 @@ de las primeras `rows - offset` de la rejilla activa.
 | RF-53 | Unit (`gui`) | los bindings Shift+PageUp/PageDown/Home/End resuelven a las nuevas acciones |
 | RF-53 | Manual | rueda del ratón en la app con salida larga (`seq 1 200`) |
 
+## 7. Control de scroll y pantalla alterna (RF-55, RF-56)
+
+Origen: `glow -p` no usa su propio paginador, ejecuta `less -r`. Para
+desplazarse **hacia arriba**, `less` posiciona el cursor en la última fila y
+emite `ESC M` (Índice Inverso / RI) repetidamente. El parser ignoraba `ESC M`,
+así que subir en `less`/`glow` no movía la pantalla (la salida se comparó contra
+`pyte` y difería). Además, la rueda del ratón no llegaba a la aplicación en
+pantalla alterna, por lo que tampoco se podía paginar con el ratón.
+
+### 7.1. Estructura de módulos
+
+| Módulo | Responsabilidad | RF |
+|--------|-----------------|----|
+| `core::parser` | Reconocer `ESC D` (IND), `ESC M` (RI) y `ESC E` (NEL) como acciones propias | RF-55 |
+| `core::engine` | Aplicar IND/RI/NEL: mover cursor o desplazar la pantalla según la fila | RF-55, CL-17, CL-18 |
+| `core::buffer` | `scroll_down(n)` real (desplaza el contenido hacia abajo y blanquea la parte superior) y reutilizar `main_line_feed`/`alternate_line_feed` para IND | RF-55, CL-17, CL-18 |
+| `terminal` | Rueda del ratón: si la pantalla alterna está activa, reenviar flechas a la aplicación | RF-56 |
+
+### 7.2. Modelo de datos
+
+```rust
+// terminal_core/src/parser.rs — RF-55
+enum Action {
+    // …existentes…
+    Index,        // ESC D
+    ReverseIndex, // ESC M
+    NextLine,     // ESC E
+}
+
+// terminal_core/src/buffer.rs — RF-55
+impl ScreenBuffer {
+    // Sustituye el stub actual (no-op) por un desplazamiento real.
+    pub fn scroll_down(&mut self, n: usize);
+}
+```
+
+Sin estado nuevo: IND/RI/NEL reutilizan el cursor y el buffer existentes; el
+desplazamiento hacia arriba en la pantalla principal sigue pasando por
+`push_scrollback_line` (RF-15, CL-18).
+
+### 7.3. Decisiones justificadas
+
+| Tema | Decisión | Alternativa descartada | Razón |
+|------|----------|------------------------|-------|
+| Alcance de RI | `ESC M` mueve el cursor si no está en la fila 0; en la fila 0 desplaza el contenido hacia abajo | desplazar siempre el contenido | Es la semántica VT100 y lo que `less` espera al paginar |
+| Historial en RI | no alimenta el scrollback | insertar la línea superior en el historial | RI inserta contenido *nuevo* arriba; el historial solo registra lo que sale por arriba (CL-17) |
+| IND en la pantalla principal | reutiliza `main_line_feed` (la línea que sale entra al historial) | no tocar el historial | CL-18; comportamiento consistente con LF |
+| NEL | IND + columna 0 | acción separada con lógica duplicada | NEL es IND con retorno de carro (ECMA-48) |
+| Origen del scroll en alterna | reenviar flechas a la aplicación | mover el offset del scrollback | La pantalla alterna no tiene historial (CL-16); el paginador es quien decide cuánto avanzar |
+| Codificación de las flechas | reutilizar `input::key_event_to_bytes` | bytes `ESC[A` a mano | Una sola fuente de verdad si se añade DECCKM más adelante |
+| Mouse reporting | fuera de alcance (CL-19) | implementar `?1000/1002/1003/1006` | La spec lo excluye explícitamente ("Fuera de alcance") |
+
+### 7.4. Estrategia de tests
+
+| RF / CL | Tipo | Casos |
+|---------|------|-------|
+| RF-55 | Unit (`core`) | `ESC D`/`ESC M`/`ESC E` se parsean a `Index`/`ReverseIndex`/`NextLine` |
+| RF-55 | Unit (`core`) | RI en fila > 0 solo sube el cursor; IND en fila < última solo baja el cursor; NEL baja y va a columna 0 |
+| RF-55 / CL-17 | Unit (`core`) | RI en la fila 0 inserta una línea en blanco arriba y descarta la última, sin tocar el scrollback |
+| RF-55 / CL-18 | Unit (`core`) | IND en la última fila de la pantalla principal mete la línea que sale en el scrollback; en alterna la descarta |
+| RF-55 | Unit (`core`) | `ScreenBuffer::scroll_down(n)` desplaza y blanquea las `n` filas superiores |
+| RF-56 | Unit (`gui`) | con pantalla alterna activa, la rueda produce bytes de flecha; sin ella, produce scroll de scrollback |
+| RF-55 | Manual/end-to-end | capturar `less`/`glow -p` con un PTY (bajar y subir) y comparar la rejilla con `pyte` |
+
+## 8. Región de scroll DECSTBM (RF-57)
+
+Origen: el modo TUI de `glow` (bubbletea) no usa `less`: define una región de
+scroll con `ESC[Pt;Pbr` (p. ej. filas 1..29, dejando la última para la barra de
+estado) y pagina moviendo el cursor al margen inferior y emitiendo `LF`, o
+insertando líneas (`ESC[L`) en el margen superior. El motor ignoraba la región,
+así que `LF`/`IL` desplazaban **toda** la pantalla (incluida la barra de estado)
+y el contenido quedaba desfasado.
+
+### 8.1. Estructura de módulos
+
+| Módulo | Responsabilidad | RF |
+|--------|-----------------|----|
+| `core::parser` | Reconocer `ESC[Pt;Pbr` → `Action::SetScrollRegion(top, bottom)` | RF-57 |
+| `core::engine` | Validar la región, aplicarla y situar el cursor en el margen superior | RF-57, CL-22 |
+| `core::buffer` | `scroll_top`/`scroll_bottom` en `ScreenBuffer`; `scroll_up`/`scroll_down`, `main_line_feed`/`alternate_line_feed`, `insert_lines`/`delete_lines` y RI acotados a la región | RF-57, CL-20, CL-21 |
+
+### 8.2. Modelo de datos
+
+```rust
+// terminal_core/src/buffer.rs — RF-57
+struct ScreenBuffer {
+    // …existentes…
+    scroll_top: usize,    // primera fila de la región (0-indexed)
+    scroll_bottom: usize, // última fila de la región (inclusive)
+}
+impl ScreenBuffer {
+    pub fn set_scroll_region(&mut self, top: usize, bottom: usize);
+}
+```
+
+`scroll_top`/`scroll_bottom` por defecto abarcan toda la pantalla, así que sin
+`DECSTBM` el comportamiento es el actual. `resize` reajusta la región (la
+extiende si abarcaba toda la pantalla; la recorta en otro caso).
+
+### 8.3. Decisiones justificadas
+
+| Tema | Decisión | Alternativa descartada | Razón |
+|------|----------|------------------------|-------|
+| Modelo de la región | dos índices en `ScreenBuffer` (por buffer) | estado global del motor | La pantalla principal y la alterna tienen márgenes independientes |
+| Cursor al definir la región | se mueve al margen superior (VT100) | dejarlo donde estaba (como `pyte`) | Es el comportamiento de xterm/VTE; las apps (bubbletea) igualmente posicionan el cursor justo después, así que no altera la verificación end-to-end |
+| Scrollback | solo si la región abarca toda la pantalla | siempre que la fila 0 salga | Un scroll dentro de una subregión no representa salida real de la pantalla (CL-20) |
+| `IL`/`DL` fuera de la región | se ignoran | aplicarlos igualmente | xterm los descarta si el cursor está fuera de los márgenes |
+| `LF` por debajo del margen | el cursor se acota al margen inferior | bajarlo hasta el final de la pantalla | Comportamiento de `pyte`/xterm; además bubbletea siempre se posiciona en el margen |
+| `SU`/`SD` (`ESC[S`/`ESC[T`) | fuera de alcance de esta tarea | implementarlos | bubbletea no los usa; se mantiene el cambio enfocado |
+
+### 8.4. Estrategia de tests
+
+| RF / CL | Tipo | Casos |
+|---------|------|-------|
+| RF-57 | Unit (`core`) | `ESC[2;4r` → `SetScrollRegion(2,4)`; `ESC[;29r` → `SetScrollRegion(1,29)` |
+| RF-57 / CL-20 | Unit (`core`) | con región 2..4, `LF` en el margen inferior desplaza solo la región y no toca filas 1 y 5; no alimenta el scrollback |
+| RF-57 / CL-21 | Unit (`core`) | con región 2..4, `RI` en el margen superior desplaza la región hacia abajo |
+| RF-57 | Unit (`core`) | `IL`/`DL` dentro de la región mueven las filas de la región; fuera de ella no hacen nada |
+| RF-57 / CL-22 | Unit (`core`) | `ESC[4;2r` (inválida) se ignora |
+| RF-57 | Unit (`core`) | `resize` reajusta la región |
+| RF-57 | Manual/end-to-end | capturar el TUI de `glow` (`glow -t AGENTS.md`) bajando con flechas y comparar con `pyte` |
+
+## 9. Color de la barra de pestañas (RF-58)
+
+La barra se pintaba con la paleta ANSI (`color(0)` para el fondo y las
+pestañas inactivas, `color(8)` para la activa). Con temas donde `ansi.black` es
+claro (p. ej. Catppuccin, `#45475a`) la barra queda gris y contrasta con el
+fondo de la terminal. Pasa a usar el **fondo del tema**
+(`palette.background`, de `colors.primary.background`).
+
+| Módulo | Responsabilidad | RF |
+|--------|-----------------|----|
+| `render::renderer` | `push_tab_bar`: fondo de la barra y pestañas inactivas con `palette.background`; pestaña activa como chip oscuro (`color(0)`) con esquinas redondeadas vía SDF; dibujo de la `×` | RF-58, RF-59 |
+| `gui::tab_bar` | `TabRect` reserva el área de la `×` (`close_x`) y expone `close_hit` | RF-59 |
+| `terminal` | Clic en la barra: la `×` cierra la pestaña, el resto la enfoca | RF-59 |
+
+Decisiones:
+
+- No se añaden claves de configuración nuevas; el fondo del tema ya es la
+  referencia del *chrome* (RF-42) y la pestaña activa usa el slot ANSI "negro".
+- Esquinas redondeadas: se calcula la distancia con signo en el *fragment
+  shader* a partir de las coordenadas locales del quad y el radio (nuevos
+  atributos `local`/`params` en `QuadVertex`). Alternativas descartadas:
+  geometría de esquinas (más vértices y triángulos por pestaña) o un pipeline
+  aparte (más código y un *draw call* extra). El radio es 0 para el resto de
+  quads, así que el coste es un par de operaciones por fragmento.
+- El chip activo se separa verticalmente del borde de la barra para que el
+  redondeo no toque el borde superior.
+- La `×` se dibuja en todas las pestañas (una celda), centrada en el área
+  reservada a la derecha del título.
+
+Tests: unitarios de `gui::tab_bar` (`layout` reserva la `×`, `close_hit`
+distingue el borde) y verificación manual con una vista previa offscreen (la
+elección de colores y el redondeo necesitan GPU, no entran en CI).
+
+## 10. Identidad e icono de la aplicación (RF-60)
+
+La ventana solo fijaba el *título* (`with_title`), así que Wayland no tenía
+`app_id` (el shell mostraba "desconocido") y, sin `.desktop`, tampoco icono.
+
+| Módulo | Responsabilidad | RF |
+|--------|-----------------|----|
+| `terminal/src/main.rs` | `WindowAttributes::with_name("terminal", "terminal")` en Linux (trait `WindowAttributesExtWayland`, que escribe el `app_id`/`WM_CLASS` compartido) | RF-60 |
+| `assets/terminal.desktop` | Entrada de escritorio (`Icon=terminal`, `StartupWMClass=terminal`) | RF-60 |
+| `assets/terminal.png` | Icono 256×256 | RF-60 |
+| `assets/install-desktop.sh` | Instala la entrada y el icono en `$XDG_DATA_HOME` | RF-60 |
+
+Decisiones:
+
+- En Wayland el icono de ventana no existe como protocolo: el shell lo toma de
+  la entrada `.desktop` cuyo nombre coincide con el `app_id`. Por eso el
+  `app_id` debe ser `terminal` y el archivo `terminal.desktop`.
+- No se añade el icono vía `with_window_icon`: requeriría embeber/decodificar
+  una imagen (dependencia extra) y no tiene efecto en Wayland. En GNOME/X11 el
+  `.desktop` (vía `WM_CLASS`) también resuelve el icono.
+- El `Exec` del `.desktop` es `terminal`, pensado para una instalación del
+  binario en el `PATH`; el lanzamiento desde el repositorio (`cargo run`) ya se
+  asocia por `app_id`.
+
+Tests: verificación manual: `WAYLAND_DEBUG=1` muestra
+`xdg_toplevel.set_app_id("terminal")`; `desktop-file-validate` acepta la
+entrada.
+
+
+
+
+
 
 

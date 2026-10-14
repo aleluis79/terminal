@@ -110,6 +110,8 @@ pub struct TabLabel<'a> {
     pub width: u32,
     /// Whether this tab is the active one.
     pub active: bool,
+    /// Left edge of the close button (`×`) area.
+    pub close_x: u32,
 }
 
 /// Tab bar drawn above the terminal grid.
@@ -203,6 +205,18 @@ struct QuadVertex {
     b: f32,
     /// Alpha color component.
     a: f32,
+    /// X offset from the quad centre, in pixels (for the rounded-corner SDF).
+    lx: f32,
+    /// Y offset from the quad centre, in pixels.
+    ly: f32,
+    /// Half the quad width in pixels.
+    hx: f32,
+    /// Half the quad height in pixels.
+    hy: f32,
+    /// Corner radius in pixels; `0` means a plain rectangle (RF-58).
+    radius: f32,
+    /// Padding to keep the vertex a multiple of 4 bytes.
+    _pad: f32,
 }
 
 impl QuadVertex {
@@ -226,6 +240,16 @@ impl QuadVertex {
                     offset: 16,
                     shader_location: 2,
                 },
+                wgpu::VertexAttribute {
+                    format: VertexFormat::Float32x2,
+                    offset: 32,
+                    shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: VertexFormat::Float32x4,
+                    offset: 40,
+                    shader_location: 4,
+                },
             ],
             step_mode: wgpu::VertexStepMode::Vertex,
         }
@@ -238,6 +262,8 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) local: vec2<f32>,
+    @location(3) params: vec4<f32>,
 }
 
 @vertex
@@ -245,11 +271,15 @@ fn vs_main(
     @location(0) pos: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) local: vec2<f32>,
+    @location(4) params: vec4<f32>,
 ) -> VertexOutput {
     var out: VertexOutput;
     out.position = vec4<f32>(pos, 0.0, 1.0);
     out.uv = uv;
     out.color = color;
+    out.local = local;
+    out.params = params;
     return out;
 }
 
@@ -260,7 +290,20 @@ fn vs_main(
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // R channel holds glyph coverage; the vertex color provides the tint.
     let mask = textureSample(my_texture, my_sampler, in.uv).r;
-    return vec4<f32>(in.color.rgb, in.color.a * mask);
+    var alpha = in.color.a * mask;
+
+    // Rounded rectangle: signed distance to the rounded box, using the quad
+    // centre offset (`local`) and the half extents (`params.xy`). `params.z`
+    // is the radius; 0 keeps a plain rectangle.
+    let radius = in.params.z;
+    if (radius > 0.0) {
+        let half = in.params.xy;
+        let q = abs(in.local) - (half - vec2<f32>(radius, radius));
+        let dist = length(max(q, vec2<f32>(0.0, 0.0))) - radius;
+        alpha = alpha * clamp(0.5 - dist, 0.0, 1.0);
+    }
+
+    return vec4<f32>(in.color.rgb, alpha);
 }
 ";
 
@@ -758,6 +801,12 @@ impl TerminalRenderer {
                         italic: false,
                     });
                 }
+                // Close button glyph (RF-59).
+                self.upload_glyph(GlyphKey {
+                    ch: '×',
+                    bold: false,
+                    italic: false,
+                });
             }
         }
     }
@@ -1073,17 +1122,11 @@ impl TerminalRenderer {
             (uv.1 + uv.3) * 0.5,
         );
 
-        // Bar background.
-        self.push_quad(
-            vertices,
-            indices,
-            0.0,
-            0.0,
-            total_w,
-            bar_h,
-            solid,
-            self.color(0),
-        );
+        // Bar background. Use the theme background rather than ANSI black so
+        // the chrome stays dark even in themes where `ansi.black` is light
+        // (RF-58).
+        let bar_bg = unpack_rgba(self.palette.background);
+        self.push_quad(vertices, indices, 0.0, 0.0, total_w, bar_h, solid, bar_bg);
 
         // Vertically centre the title text within the bar.
         let baseline = (bar_h - self.cell_height as f32) * 0.5 + self.ascent;
@@ -1092,40 +1135,67 @@ impl TerminalRenderer {
         for tab in bar.tabs {
             let x = tab.x as f32;
             let w = tab.width as f32;
+            let close_x = tab.close_x as f32;
 
-            // Highlight the active tab.
+            // The active tab is a darker, rounded chip (RF-58); inactive tabs
+            // share the bar background.
             let (bg, fg) = if tab.active {
-                (self.color(8), self.color(15))
+                (self.color(0), self.color(15))
             } else {
-                (self.color(0), self.color(7))
+                (bar_bg, self.color(7))
             };
-            self.push_quad(vertices, indices, x, 0.0, w, bar_h, solid, bg);
+            if tab.active {
+                let inset = (bar_h * 0.15).clamp(2.0, 4.0);
+                let chip_h = (bar_h - inset * 2.0).max(1.0);
+                let radius = (chip_h * 0.35).clamp(3.0, 8.0);
+                self.push_rounded_quad(vertices, indices, x, inset, w, chip_h, solid, bg, radius);
+            }
 
-            // Centre the title inside the tab.
+            // Centre the title in the area left of the close button.
+            let title_area = (close_x - x).max(0.0);
             let text_w = tab.title.chars().count() as f32 * title_w;
-            let mut pen = x + (w - text_w) * 0.5;
+            let mut pen = x + (title_area - text_w) * 0.5;
             for ch in tab.title.chars() {
-                let key = GlyphKey {
-                    ch,
-                    bold: false,
-                    italic: false,
-                };
-                if let Some(Some(glyph)) = self.glyph_cache.get(&key) {
-                    let (uv_left, uv_bottom, uv_right, uv_top) =
-                        glyph.region.uv(self.atlas.dimensions());
-                    self.push_quad(
-                        vertices,
-                        indices,
-                        pen + glyph.left,
-                        baseline - glyph.top,
-                        glyph.width,
-                        glyph.height,
-                        (uv_left, uv_bottom, uv_right, uv_top),
-                        fg,
-                    );
-                }
+                self.push_bar_glyph(vertices, indices, ch, pen, baseline, fg, title_w);
                 pen += title_w;
             }
+
+            // Close button (`×`) on the right (RF-59).
+            let close_area = (w - (close_x - x)).max(0.0);
+            let close_pen = close_x + (close_area - title_w) * 0.5;
+            self.push_bar_glyph(vertices, indices, '×', close_pen, baseline, fg, title_w);
+        }
+    }
+
+    /// Push one tab-bar glyph (title character or close button).
+    #[expect(clippy::too_many_arguments, reason = "Glyph quad geometry + colour")]
+    fn push_bar_glyph(
+        &self,
+        vertices: &mut Vec<QuadVertex>,
+        indices: &mut Vec<u32>,
+        ch: char,
+        pen: f32,
+        baseline: f32,
+        fg: [f32; 4],
+        _advance: f32,
+    ) {
+        let key = GlyphKey {
+            ch,
+            bold: false,
+            italic: false,
+        };
+        if let Some(Some(glyph)) = self.glyph_cache.get(&key) {
+            let (uv_left, uv_bottom, uv_right, uv_top) = glyph.region.uv(self.atlas.dimensions());
+            self.push_quad(
+                vertices,
+                indices,
+                pen + glyph.left,
+                baseline - glyph.top,
+                glyph.width,
+                glyph.height,
+                (uv_left, uv_bottom, uv_right, uv_top),
+                fg,
+            );
         }
     }
 
@@ -1195,6 +1265,48 @@ impl TerminalRenderer {
         uv: (f32, f32, f32, f32),
         color: [f32; 4],
     ) {
+        self.push_quad_impl(vertices, indices, x, y, w, h, uv, color, 0.0);
+    }
+
+    /// Push a quad with rounded corners (RF-58).
+    ///
+    /// `radius` is in pixels; the fragment shader carves the corners with a
+    /// signed-distance field, giving an antialiased edge.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Geometry helper: position, size, UV, color and radius"
+    )]
+    fn push_rounded_quad(
+        &self,
+        vertices: &mut Vec<QuadVertex>,
+        indices: &mut Vec<u32>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uv: (f32, f32, f32, f32),
+        color: [f32; 4],
+        radius: f32,
+    ) {
+        self.push_quad_impl(vertices, indices, x, y, w, h, uv, color, radius);
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Quad geometry + colour + corner radius"
+    )]
+    fn push_quad_impl(
+        &self,
+        vertices: &mut Vec<QuadVertex>,
+        indices: &mut Vec<u32>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uv: (f32, f32, f32, f32),
+        color: [f32; 4],
+        radius: f32,
+    ) {
         // Guard against overflowing the pre-allocated buffers.
         if vertices.len() + 4 > self.vertex_capacity || indices.len() + 6 > self.index_capacity {
             return;
@@ -1202,47 +1314,31 @@ impl TerminalRenderer {
 
         let base = vertices.len() as u32;
         let (left, top, right, bottom) = uv;
+        let (hx, hy) = (w * 0.5, h * 0.5);
 
-        vertices.push(QuadVertex {
-            x,
-            y,
-            u: left,
-            v: top,
+        // `local` is the offset from the quad centre, in pixels, used by the
+        // rounded-corner SDF in the fragment shader.
+        let corner = |px: f32, py: f32, u: f32, v: f32, lx: f32, ly: f32| QuadVertex {
+            x: px,
+            y: py,
+            u,
+            v,
             r: color[0],
             g: color[1],
             b: color[2],
             a: color[3],
-        });
-        vertices.push(QuadVertex {
-            x: x + w,
-            y,
-            u: right,
-            v: top,
-            r: color[0],
-            g: color[1],
-            b: color[2],
-            a: color[3],
-        });
-        vertices.push(QuadVertex {
-            x,
-            y: y + h,
-            u: left,
-            v: bottom,
-            r: color[0],
-            g: color[1],
-            b: color[2],
-            a: color[3],
-        });
-        vertices.push(QuadVertex {
-            x: x + w,
-            y: y + h,
-            u: right,
-            v: bottom,
-            r: color[0],
-            g: color[1],
-            b: color[2],
-            a: color[3],
-        });
+            lx,
+            ly,
+            hx,
+            hy,
+            radius,
+            _pad: 0.0,
+        };
+
+        vertices.push(corner(x, y, left, top, -hx, -hy));
+        vertices.push(corner(x + w, y, right, top, hx, -hy));
+        vertices.push(corner(x, y + h, left, bottom, -hx, hy));
+        vertices.push(corner(x + w, y + h, right, bottom, hx, hy));
 
         indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
     }
