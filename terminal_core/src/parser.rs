@@ -153,6 +153,19 @@ enum ParserState {
     Osc,
 }
 
+/// A character set selectable with an `ESC ( <final>` / `ESC ) <final>`
+/// designation (RF-61).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Charset {
+    /// US-ASCII / ISO 8859-1 (`ESC ( B`).
+    #[default]
+    Ascii,
+    /// DEC Special Graphics (`ESC ( 0`): ASCII letters draw box-drawing and
+    /// symbol glyphs, which is how ncurses applications (nmon, htop, mc) paint
+    /// their borders.
+    DecSpecialGraphics,
+}
+
 /// ANSI escape sequence parser.
 pub struct Parser {
     state: ParserState,
@@ -166,6 +179,17 @@ pub struct Parser {
     csi_private: Option<u8>,
     osc_payload: Vec<u8>,
     utf8_buf: Vec<u8>,
+    /// Charset designated for the G0 register (RF-61).
+    g0_charset: Charset,
+    /// Charset designated for the G1 register (RF-61).
+    g1_charset: Charset,
+    /// Which register is active as GL: `0` for G0, `1` for G1 (RF-61).
+    ///
+    /// Switched by SO (`0x0E`, selects G1) and SI (`0x0F`, selects G0).
+    gl_register: u8,
+    /// Intermediate byte of the `ESC <intermediate> <final>` sequence being
+    /// read, used to tell a charset designator (`ESC ( 0`) from any other.
+    escape_intermediate: Option<u8>,
 }
 
 impl Default for Parser {
@@ -185,6 +209,10 @@ impl Parser {
             csi_private: None,
             osc_payload: Vec::new(),
             utf8_buf: Vec::new(),
+            g0_charset: Charset::Ascii,
+            g1_charset: Charset::Ascii,
+            gl_register: 0,
+            escape_intermediate: None,
         }
     }
 
@@ -203,9 +231,11 @@ impl Parser {
             ParserState::Csi => self.parse_csi(byte),
             ParserState::Osc => self.parse_osc(byte),
             ParserState::EscapeIntermediate => {
-                // Consume the final byte of `ESC <intermediate> <final>`
-                // (charset and similar designators) and ignore the sequence.
+                // Final byte of `ESC <intermediate> <final>`: a charset
+                // designator (`ESC ( 0`) selects the charset, anything else
+                // (`ESC # 8`, …) is consumed and ignored.
                 self.state = ParserState::Normal;
+                self.designate_charset(byte);
                 Vec::new()
             }
         }
@@ -229,6 +259,10 @@ impl Parser {
         self.csi_private = None;
         self.osc_payload.clear();
         self.utf8_buf.clear();
+        self.g0_charset = Charset::Ascii;
+        self.g1_charset = Charset::Ascii;
+        self.gl_register = 0;
+        self.escape_intermediate = None;
     }
 
     fn parse_normal(&mut self, byte: u8) -> Vec<Action> {
@@ -291,13 +325,21 @@ impl Parser {
                 // BS
                 return vec![Action::Backspace];
             }
+            0x0e => {
+                // SO (Shift Out): G1 becomes the active GL register (RF-61).
+                self.gl_register = 1;
+            }
+            0x0f => {
+                // SI (Shift In): G0 becomes the active GL register (RF-61).
+                self.gl_register = 0;
+            }
             0x18 | 0x1a => {
                 // CAN / SUB (legacy cancel)
                 self.reset();
             }
             0x20..=0x7e => {
-                // Printable ASCII
-                return vec![Action::Write(byte as char)];
+                // Printable ASCII — mapped through the active charset (RF-61).
+                return vec![Action::Write(self.map_charset(byte))];
             }
             0x7f => {
                 // DEL — replace with U+FFFD (CL-2)
@@ -340,7 +382,9 @@ impl Parser {
             0x20..=0x2f => {
                 // Intermediate byte: `ESC <intermediate> <final>` (character
                 // set designators like `ESC ( B`, `ESC ) 0`, `ESC # 8`, …).
-                // Consume the final byte so it is not mistaken for text.
+                // Remember it so the final byte can select the charset; the
+                // final byte is consumed either way and never leaks as text.
+                self.escape_intermediate = Some(byte);
                 self.state = ParserState::EscapeIntermediate;
                 Vec::new()
             }
@@ -348,6 +392,47 @@ impl Parser {
                 // Unknown ESC sequence
                 Vec::new()
             }
+        }
+    }
+
+    /// Handle the final byte of an `ESC <intermediate> <final>` sequence
+    /// (RF-61).
+    ///
+    /// `ESC ( <final>` designates G0, `ESC ) <final>` designates G1. Other
+    /// intermediates (`*`, `+`, `#`, …) are consumed and ignored.
+    fn designate_charset(&mut self, final_byte: u8) {
+        let charset = match final_byte {
+            b'0' => Charset::DecSpecialGraphics,
+            // `B` is US-ASCII; `A` is the (near-identical) UK set. Any other
+            // designation falls back to ASCII so a letter is never dropped.
+            _ => Charset::Ascii,
+        };
+        match self.escape_intermediate.take() {
+            Some(b'(') => self.g0_charset = charset,
+            Some(b')') => self.g1_charset = charset,
+            _ => {}
+        }
+    }
+
+    /// Translate a printable ASCII byte through the active charset (RF-61).
+    ///
+    /// In DEC Special Graphics each byte maps to a box-drawing or symbol glyph;
+    /// bytes outside the table keep their literal character.
+    fn map_charset(&self, byte: u8) -> char {
+        if self.active_charset() == Charset::DecSpecialGraphics {
+            if let Some(c) = dec_special_graphic(byte) {
+                return c;
+            }
+        }
+        byte as char
+    }
+
+    /// The charset currently mapped to GL.
+    fn active_charset(&self) -> Charset {
+        if self.gl_register == 1 {
+            self.g1_charset
+        } else {
+            self.g0_charset
         }
     }
 
@@ -713,6 +798,50 @@ impl Parser {
             Vec::new()
         }
     }
+}
+
+/// Map a byte to its glyph in the DEC Special Graphics charset (RF-61).
+///
+/// Table from the VT100 manual, matching ncurses' `acsc` capability: the ASCII
+/// bytes `j`…`x` draw box-drawing corners and lines, and the surrounding bytes
+/// draw the VT100 decorations and symbols.
+fn dec_special_graphic(byte: u8) -> Option<char> {
+    let c = match byte {
+        b'`' => '\u{25c6}', // ◆
+        b'a' => '\u{2592}', // ▒
+        b'b' => '\u{2409}', // ␉
+        b'c' => '\u{240c}', // ␌
+        b'd' => '\u{240d}', // ␍
+        b'e' => '\u{240a}', // ␊
+        b'f' => '\u{00b0}', // °
+        b'g' => '\u{00b1}', // ±
+        b'h' => '\u{2424}', // ␤
+        b'i' => '\u{240b}', // ␋
+        b'j' => '\u{2518}', // ┘
+        b'k' => '\u{2510}', // ┐
+        b'l' => '\u{250c}', // ┌
+        b'm' => '\u{2514}', // └
+        b'n' => '\u{253c}', // ┼
+        b'o' => '\u{23ba}', // ⎺
+        b'p' => '\u{23bb}', // ⎻
+        b'q' => '\u{2500}', // ─
+        b'r' => '\u{23bc}', // ⎼
+        b's' => '\u{23bd}', // ⎽
+        b't' => '\u{251c}', // ├
+        b'u' => '\u{2524}', // ┤
+        b'v' => '\u{2534}', // ┴
+        b'w' => '\u{252c}', // ┬
+        b'x' => '\u{2502}', // │
+        b'y' => '\u{2264}', // ≤
+        b'z' => '\u{2265}', // ≥
+        b'{' => '\u{03c0}', // π
+        b'|' => '\u{2260}', // ≠
+        b'}' => '\u{00a3}', // £
+        b'~' => '\u{00b7}', // ·
+        b'_' => ' ',        // blank
+        _ => return None,
+    };
+    Some(c)
 }
 
 #[cfg(test)]
@@ -1204,6 +1333,92 @@ mod tests {
         assert_eq!(parser.parse_bytes(b"\x1b)0Z"), vec![Action::Write('Z')]);
         // `ESC # 8` (DECALN) is ignored.
         assert_eq!(parser.parse_bytes(b"\x1b#8X"), vec![Action::Write('X')]);
+    }
+
+    #[test]
+    fn test_parse_dec_special_graphics_maps_box_drawing() {
+        // RF-61: `ESC ( 0` switches G0 to DEC Special Graphics, so the ASCII
+        // letters used by ncurses (nmon, htop) draw lines instead of text.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b(0qxlkmjntvwu"),
+            vec![
+                Action::Write('─'), // q
+                Action::Write('│'), // x
+                Action::Write('┌'), // l
+                Action::Write('┐'), // k
+                Action::Write('└'), // m
+                Action::Write('┘'), // j
+                Action::Write('┼'), // n
+                Action::Write('├'), // t
+                Action::Write('┴'), // v
+                Action::Write('┬'), // w
+                Action::Write('┤'), // u
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_dec_special_graphics_symbols() {
+        // The same charset also carries non-line symbols (`°`, `±`, `·`, `≠`).
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b(0fg~|"),
+            vec![
+                Action::Write('°'),
+                Action::Write('±'),
+                Action::Write('·'),
+                Action::Write('≠'),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_charset_switch_back_to_ascii() {
+        // `ESC ( B` restores ASCII, so the same letter prints literally again.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b(0q\x1b(Bq"),
+            vec![Action::Write('─'), Action::Write('q')]
+        );
+    }
+
+    #[test]
+    fn test_parse_charset_leaves_unmapped_bytes_alone() {
+        // Bytes outside the DEC graphics table are unchanged, and the charset
+        // only affects GL (ASCII), not the pending UTF-8 decoder.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b(0A Z\"#"),
+            vec![
+                Action::Write('A'),
+                Action::Write(' '),
+                Action::Write('Z'),
+                Action::Write('"'),
+                Action::Write('#'),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_g1_charset_activated_by_shift_out() {
+        // RF-61: `ESC ) 0` designates G1; SO (0x0E) makes it the active GL and
+        // SI (0x0F) brings G0 back.
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b)0q\x0eq\x0fq"),
+            vec![Action::Write('q'), Action::Write('─'), Action::Write('q')]
+        );
+    }
+
+    #[test]
+    fn test_parse_full_reset_restores_ascii_charset() {
+        // `ESC c` (RIS) must clear the selected charset (CL-23).
+        let mut parser = Parser::new();
+        assert_eq!(
+            parser.parse_bytes(b"\x1b(0\x1bcq"),
+            vec![Action::ResetAttributes, Action::Write('q')]
+        );
     }
 
     #[test]

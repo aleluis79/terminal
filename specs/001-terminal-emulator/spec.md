@@ -96,6 +96,7 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - RF-58: EL SISTEMA pinta la barra de pestañas y las pestañas inactivas con el color de fondo del tema (`colors.primary.background`); la pestaña activa se dibuja como un chip de color más oscuro (`ansi.black`) con esquinas redondeadas.
 - RF-59: DONDE el usuario hace clic en la `×` de la derecha de una pestaña, EL SISTEMA cierra esa pestaña con sus paneles; DONDE era la última pestaña, EL SISTEMA cierra la aplicación (CL-7).
 - RF-60: EL SISTEMA identifica la ventana con el nombre de aplicación `terminal` (app_id de Wayland / `WM_CLASS` de X11) y provee `assets/terminal.desktop` con `Icon=terminal` e `StartupWMClass=terminal` junto con `assets/terminal.png`, de modo que el entorno de escritorio muestre el nombre y el icono de la aplicación en la barra de tareas.
+- RF-61: CUANDO el programa selecciona el juego de caracteres DEC Special Graphics (`ESC ( 0`), EL SISTEMA dibuja los caracteres ASCII de la zona `0x60`–`0x7e` y el `_` como sus glifos de líneas y símbolos (`q`→`─`, `x`→`│`, `l`→`┌`, `j`→`┘`, `n`→`┼`, `f`→`°`, `~`→`·`, …) en vez de las letras; DONDE el programa selecciona el juego ASCII (`ESC ( B`), EL SISTEMA vuelve a dibujar las letras. El juego del registro G1 (`ESC ) 0`) se activa con SO (`0x0E`) y se desactiva con SI (`0x0F`).
 
 ## Requisitos no funcionales
 - Rendimiento: renderizado a 60 FPS con 10000 líneas de texto visibles.
@@ -126,6 +127,7 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - CL-20: Región de scroll que no abarca toda la pantalla y salto de línea en el margen inferior — EL SISTEMA desplaza solo las filas de la región, deja intactas las de arriba/abajo y no alimenta el scrollback.
 - CL-21: Región de scroll e Índice Inverso en el margen superior — EL SISTEMA desplaza la región hacia abajo; con el cursor fuera de la región, solo lo mueve sin desplazar.
 - CL-22: `ESC[Pt;Pbr` con `Pt >= Pb` — EL SISTEMA ignora la secuencia y mantiene la región anterior (pantalla completa).
+- CL-23: Programa que deja activo DEC Special Graphics y luego escribe texto ASCII normal — EL SISTEMA solo aplica el dibujo de líneas mientras el juego está seleccionado; al recibir `ESC ( B`, `SI` o un reset (`ESC c`) vuelve a dibujar las letras.
 
 ## Fuera de alcance
 - Soporte de macOS.
@@ -139,7 +141,7 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - Clipboard nativo (sin modifiers) ni drag-and-drop de archivos.
 
 ## Criterios de finalización
-- Todos los RF (1–60) tienen al menos un test automatizado o verificación manual documentada.
+- Todos los RF (1–61) tienen al menos un test automatizado o verificación manual documentada.
 - `cargo test` pasa en Linux y Windows.
 - Demo manual: abrir, crear pestañas, dividir paneles, copiar/pegar, cambiar configuración, y ejecutar `neofetch` o `htop` correctamente.
 

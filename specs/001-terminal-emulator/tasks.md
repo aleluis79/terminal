@@ -435,6 +435,11 @@
   - `terminal/src/main.rs` (`with_name("terminal", "terminal")`), `assets/terminal.desktop`, `assets/terminal.png` y `assets/install-desktop.sh`
   - Hecho cuando: `WAYLAND_DEBUG=1` muestra `set_app_id("terminal")` y el shell muestra "Terminal" con el icono
 
+- [x] **T081: Juego de caracteres DEC Special Graphics (RF-61)**
+  - RF: RF-61, CL-23
+  - `terminal_core/src/parser.rs`: registrar los designadores `ESC ( 0` / `ESC ( B` (G0) y `ESC ) 0` (G1), manejar SO/SI y traducir los caracteres ASCII al glifo Unicode de líneas/símbolos al emitir `Action::Write`
+  - Hecho cuando: `printf '\033(0q\033(Bq'` dibuja `─q` y `nmon` muestra líneas en lugar de letras; `cargo test -p terminal_core parser` pasa
+
 ## Resumen
 
 | Fase | Tareas | RFs cubiertos |
@@ -457,5 +462,6 @@
 | 15: Color de la barra de pestañas | T077 | RF-58 |
 | 16: Pestaña activa y botón × | T078-T079 | RF-58, RF-59 |
 | 17: Identidad e icono | T080 | RF-60 |
+| 18: Juego de caracteres DEC | T081 | RF-61, CL-23 |
 
-**Total: 80 tareas**
+**Total: 81 tareas**
