@@ -921,7 +921,7 @@ impl TerminalRenderer {
 
         let white = self.atlas.white_region();
         let (left, bottom, right, top) = white.uv(self.atlas.dimensions());
-        let white_uv = ((left + right) * 0.5, (bottom + top) * 0.5);
+        let white_uv = (f32::midpoint(left, right), f32::midpoint(bottom, top));
         let solid = (white_uv.0, white_uv.1, white_uv.0, white_uv.1);
 
         let cols = pane.cols;
@@ -1090,10 +1090,10 @@ impl TerminalRenderer {
         let white = self.atlas.white_region();
         let uv = white.uv(self.atlas.dimensions());
         let solid = (
-            (uv.0 + uv.2) * 0.5,
-            (uv.1 + uv.3) * 0.5,
-            (uv.0 + uv.2) * 0.5,
-            (uv.1 + uv.3) * 0.5,
+            f32::midpoint(uv.0, uv.2),
+            f32::midpoint(uv.1, uv.3),
+            f32::midpoint(uv.0, uv.2),
+            f32::midpoint(uv.1, uv.3),
         );
         let rgba = unpack_rgba(color);
         for rect in dividers {
@@ -1116,10 +1116,10 @@ impl TerminalRenderer {
         let white = self.atlas.white_region();
         let uv = white.uv(self.atlas.dimensions());
         let solid = (
-            (uv.0 + uv.2) * 0.5,
-            (uv.1 + uv.3) * 0.5,
-            (uv.0 + uv.2) * 0.5,
-            (uv.1 + uv.3) * 0.5,
+            f32::midpoint(uv.0, uv.2),
+            f32::midpoint(uv.1, uv.3),
+            f32::midpoint(uv.0, uv.2),
+            f32::midpoint(uv.1, uv.3),
         );
 
         // Bar background. Use the theme background rather than ANSI black so

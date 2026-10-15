@@ -20,6 +20,9 @@ pub struct Config {
     /// Keyboard bindings.
     #[serde(default)]
     pub keyboard: KeyboardConfig,
+    /// Shell selection (default shell and named profiles) (RF-62).
+    #[serde(default)]
+    pub shell: ShellConfig,
 }
 
 /// Window configuration.
@@ -268,6 +271,38 @@ pub struct KeyBinding {
     pub action: String,
 }
 
+/// Shell selection settings (RF-62, RF-64).
+///
+/// `program`/`args` describe the shell used for new sessions; `profiles` is the
+/// list of shells the user can pick (cmd, powershell, wsl, …). An empty
+/// `profiles` list means the platform defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ShellConfig {
+    /// Program run by default for new sessions (`None` = shell of the system).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// Arguments passed to the default shell.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Named shell profiles the user can open.
+    #[serde(default)]
+    pub profiles: Vec<ShellProfile>,
+}
+
+/// A named shell the user can pick (RF-64).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ShellProfile {
+    /// Display name (e.g., `"powershell"`).
+    #[serde(default)]
+    pub name: String,
+    /// Program to run (e.g., `"powershell.exe"`).
+    #[serde(default)]
+    pub program: String,
+    /// Arguments passed to the program.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 // Default value functions
 fn default_title() -> String {
     "Terminal".to_string()
@@ -421,6 +456,57 @@ mod tests {
         let parsed: Config =
             toml::from_str("[window]\nmaximized = true\n").expect("window config should parse");
         assert!(parsed.window.maximized);
+    }
+
+    #[test]
+    fn test_shell_config_defaults() {
+        let shell = Config::default().shell;
+        assert_eq!(shell.program, None);
+        assert_eq!(shell.args, Vec::<String>::new());
+        assert_eq!(shell.profiles, Vec::new());
+    }
+
+    #[test]
+    fn test_shell_config_parses_program_and_profiles() {
+        // RF-62, RF-64: default shell plus a list of pickable profiles.
+        let toml = r#"
+[shell]
+program = "wsl.exe"
+args = ["-d", "Ubuntu"]
+
+[[shell.profiles]]
+name = "cmd"
+program = "cmd.exe"
+
+[[shell.profiles]]
+name = "powershell"
+program = "powershell.exe"
+args = ["-NoLogo"]
+"#;
+        let config: Config = toml::from_str(toml).expect("shell config should parse");
+        assert_eq!(config.shell.program.as_deref(), Some("wsl.exe"));
+        assert_eq!(config.shell.args, vec!["-d", "Ubuntu"]);
+        assert_eq!(config.shell.profiles.len(), 2);
+        assert_eq!(config.shell.profiles[0].name, "cmd");
+        assert_eq!(config.shell.profiles[0].program, "cmd.exe");
+        assert_eq!(config.shell.profiles[0].args, Vec::<String>::new());
+        assert_eq!(config.shell.profiles[1].args, vec!["-NoLogo"]);
+    }
+
+    #[test]
+    fn test_shell_config_round_trip() {
+        let mut config = Config::default();
+        config.shell.program = Some("wsl.exe".to_string());
+        config.shell.args = vec!["-d".to_string(), "Ubuntu".to_string()];
+        config.shell.profiles.push(ShellProfile {
+            name: "cmd".to_string(),
+            program: "cmd.exe".to_string(),
+            args: Vec::new(),
+        });
+
+        let toml = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(config, parsed);
     }
 
     #[test]

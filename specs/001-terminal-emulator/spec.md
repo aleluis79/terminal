@@ -13,6 +13,8 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - H3: Como desarrollador quiero dividir una pestaña en paneles para ver múltiples sesiones simultáneamente.
 - H4: Como desarrollador quiero cambiar la fuente y su tamaño para ajustar la legibilidad.
 - H5: Como desarrollador quiero que la configuración se lea de un archivo para no repetir argumentos.
+- H6: Como desarrollador quiero elegir la shell (cmd, powershell, wsl, …) por configuración o al crear la pestaña, para no depender de la shell por defecto del sistema.
+- H7: Como desarrollador quiero que las teclas especiales (Escape, Supr, …) se envíen con la codificación que esperan las aplicaciones de terminal, para que los editores TUI (vim, nano) respondan bien.
 
 ## Requisitos funcionales (criterios de aceptación en notación EARS)
 
@@ -98,6 +100,24 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - RF-60: EL SISTEMA identifica la ventana con el nombre de aplicación `terminal` (app_id de Wayland / `WM_CLASS` de X11) y provee `assets/terminal.desktop` con `Icon=terminal` e `StartupWMClass=terminal` junto con `assets/terminal.png`, de modo que el entorno de escritorio muestre el nombre y el icono de la aplicación en la barra de tareas.
 - RF-61: CUANDO el programa selecciona el juego de caracteres DEC Special Graphics (`ESC ( 0`), EL SISTEMA dibuja los caracteres ASCII de la zona `0x60`–`0x7e` y el `_` como sus glifos de líneas y símbolos (`q`→`─`, `x`→`│`, `l`→`┌`, `j`→`┘`, `n`→`┼`, `f`→`°`, `~`→`·`, …) en vez de las letras; DONDE el programa selecciona el juego ASCII (`ESC ( B`), EL SISTEMA vuelve a dibujar las letras. El juego del registro G1 (`ESC ) 0`) se activa con SO (`0x0E`) y se desactiva con SI (`0x0F`).
 
+### Selección de shell
+
+- RF-62: DONDE la configuración define `shell.program` y opcionalmente `shell.args`, ENTONCES EL SISTEMA lanza ese programa con esos argumentos en cada sesión nueva, en lugar de la shell por defecto del sistema.
+- RF-63: DONDE el usuario pasa `--shell` como argumento CLI, ENTONCES EL SISTEMA usa ese programa para las sesiones nuevas en vez del definido en `shell.program` (RF-33).
+- RF-64: DONDE la configuración define `shell.profiles` (lista de perfiles, cada uno con `name`, `program` y `args` opcionales), EL SISTEMA usa esos perfiles como las shells elegibles por el usuario, y el primer perfil (o `shell.program`, si existe) es el perfil por defecto.
+- RF-65: DONDE no hay perfiles configurados y el SISTEMA corre en Windows, EL SISTEMA ofrece los perfiles `cmd`, `powershell` y `wsl` para los ejecutables que existan en el sistema; DONDE corre en Linux, EL SISTEMA ofrece un único perfil por defecto con la shell del usuario (`$SHELL`).
+- RF-66: DONDE el usuario presiona el atajo del perfil N (por defecto Ctrl+Shift+1 … Ctrl+Shift+9), ENTONCES EL SISTEMA crea una pestaña nueva con una sesión del perfil N; el atajo de nueva pestaña (RF-2) crea la sesión con el perfil por defecto.
+- RF-67: DONDE el programa de la shell elegida no existe o falla al lanzarse, ENTONCES EL SISTEMA muestra un mensaje de error y abre la sesión con la shell por defecto del sistema, sin dejar la pestaña vacía.
+
+### Codificación de teclas especiales
+
+- RF-68: CUANDO el usuario presiona Escape, EL SISTEMA envía al child process el byte `ESC` (`0x1b`) y ninguna secuencia adicional.
+- RF-69: CUANDO el usuario presiona Supr (`Delete`), EL SISTEMA envía al child process la secuencia `ESC[3~`; DONDE la tecla lleva modificadores (Alt o Ctrl), EL SISTEMA envía `ESC[3;N~` con el modificador codificado.
+
+### Shell al dividir paneles
+
+- RF-70: CUANDO el usuario divide un panel (RF-6, RF-7), EL SISTEMA crea la sesión del panel nuevo con la misma shell que está corriendo en el panel dividido, en lugar del perfil por defecto (excepción a RF-62 para las sesiones creadas al dividir).
+
 ## Requisitos no funcionales
 - Rendimiento: renderizado a 60 FPS con 10000 líneas de texto visibles.
 - Memoria: uso inferior a 100 MB en carga normal (50000 líneas de scrollback).
@@ -129,6 +149,16 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - CL-22: `ESC[Pt;Pbr` con `Pt >= Pb` — EL SISTEMA ignora la secuencia y mantiene la región anterior (pantalla completa).
 - CL-23: Programa que deja activo DEC Special Graphics y luego escribe texto ASCII normal — EL SISTEMA solo aplica el dibujo de líneas mientras el juego está seleccionado; al recibir `ESC ( B`, `SI` o un reset (`ESC c`) vuelve a dibujar las letras.
 
+- CL-24: `shell.program` (o el `program` de un perfil) no existe o no es ejecutable — EL SISTEMA muestra un mensaje de error y abre la sesión con la shell por defecto del sistema (RF-67).
+- CL-25: `shell.args` (o los `args` de un perfil) con espacios o comillas — EL SISTEMA los pasa como argumentos independientes, sin reinterpretarlos como una línea de comandos.
+- CL-26: Perfil de `shell.profiles` sin `name` o sin `program` — EL SISTEMA descarta ese perfil y sigue con los demás.
+- CL-27: El usuario presiona el atajo de un perfil inexistente (p.ej. Ctrl+Shift+5 con solo 2 perfiles) — EL SISTEMA no abre ninguna pestaña.
+- CL-28: La shell elegida arranca y termina al instante (p.ej. `wsl.exe` sin distribución por defecto) — EL SISTEMA aplica CL-1 (mensaje de salida y cierra la pestaña).
+- CL-29: `wsl.exe` no está instalado — EL SISTEMA no ofrece el perfil `wsl` por defecto; si el usuario lo configura explícitamente, aplica CL-24.
+- CL-30: Escape o Supr con modificadores (Alt/Ctrl) — EL SISTEMA envía `ESC` a secas para Escape y `ESC[3;N~` para Supr, sin generar secuencias mal formadas como `ESC[[D` ni `ESC[~` (RF-68, RF-69).
+- CL-31: El panel dividido corre la shell por defecto porque su shell elegida falló al arrancar (RF-67) — EL SISTEMA crea el panel nuevo con esa misma shell (la que realmente corre), sin repetir el error.
+- CL-32: Divisiones sucesivas y cierre del panel original — EL SISTEMA hereda la shell del panel que se divide en cada operación, de modo que la shell elegida se conserva en los paneles derivados (RF-70).
+
 ## Fuera de alcance
 - Soporte de macOS.
 - Soporte de Wayland (solo X11 en Linux).
@@ -139,9 +169,11 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - Soporte de mouse reporting avanzado (solo selección de texto).
 - Soporte de terminal multiplexor integrado.
 - Clipboard nativo (sin modifiers) ni drag-and-drop de archivos.
+- Detección automática de las distribuciones WSL instaladas (se elige `wsl.exe` y sus argumentos).
+- Editor de perfiles de shell dentro de la aplicación (se editan en el archivo de configuración).
 
 ## Criterios de finalización
-- Todos los RF (1–61) tienen al menos un test automatizado o verificación manual documentada.
+- Todos los RF (1–70) tienen al menos un test automatizado o verificación manual documentada.
 - `cargo test` pasa en Linux y Windows.
 - Demo manual: abrir, crear pestañas, dividir paneles, copiar/pegar, cambiar configuración, y ejecutar `neofetch` o `htop` correctamente.
 
@@ -149,3 +181,4 @@ Construir un emulador de terminal moderno, rápido y portable que ejecute shells
 - ~~¿clipboard nativo?~~ → Solo Ctrl+Shift+C/V.
 - ~~¿drag-and-drop de archivos?~~ → Sin drag-and-drop.
 - ~~¿hot-reload de configuración?~~ → Basta con reiniciar.
+- ¿Corregir el orden de modificadores de las flechas (`KeyEvent::Arrow` manda ctrl como `3` y alt como `5`, invertido respecto a xterm y al resto de teclas especiales)? → Requiere un RF propio; pendiente de decidir.

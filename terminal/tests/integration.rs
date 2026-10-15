@@ -14,6 +14,34 @@ use terminal_gui::event::EventProcessor;
 use terminal_gui::split::{NavigateDirection, SplitLayout};
 use terminal_gui::tabs::TabManager;
 
+// Platform-specific shells and commands for the PTY integration tests.
+#[cfg(unix)]
+const TEST_SHELL: &str = "/bin/bash";
+#[cfg(windows)]
+const TEST_SHELL: &str = "cmd.exe";
+
+/// Program and arguments that exit immediately with the given code (RF-62).
+#[cfg(unix)]
+fn exit_command(code: i32) -> (&'static str, Vec<String>) {
+    let program = if code == 0 { "/bin/true" } else { "/bin/false" };
+    (program, Vec::new())
+}
+
+/// Program and arguments that exit immediately with the given code (RF-62).
+#[cfg(windows)]
+fn exit_command(code: i32) -> (&'static str, Vec<String>) {
+    (
+        "cmd.exe",
+        vec!["/c".to_string(), "exit".to_string(), code.to_string()],
+    )
+}
+
+/// Line terminator the shell treats as "Enter".
+#[cfg(unix)]
+const TEST_ENTER: &str = "\n";
+#[cfg(windows)]
+const TEST_ENTER: &str = "\r";
+
 // ============================================================================
 // Config Integration Tests
 // ============================================================================
@@ -94,7 +122,7 @@ fn test_session_basic_lifecycle() {
     // Create session, spawn shell, verify it runs
     let mut session = TerminalSession::new(24, 80);
     assert!(session.is_running());
-    assert!(session.spawn_shell("/bin/bash").is_ok());
+    assert!(session.spawn_shell(TEST_SHELL).is_ok());
     assert!(session.pid().is_some());
     assert!(session.is_running());
 }
@@ -102,13 +130,14 @@ fn test_session_basic_lifecycle() {
 #[test]
 fn test_session_write_and_read() {
     let mut session = TerminalSession::new(24, 80);
-    session.spawn_shell("/bin/bash").expect("spawn failed");
+    session.spawn_shell(TEST_SHELL).expect("spawn failed");
 
     // Give shell time to start
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Write a command
-    let _ = session.write_to_shell(b"echo hello\n");
+    let command = format!("echo hello{TEST_ENTER}");
+    let _ = session.write_to_shell(command.as_bytes());
 
     // Poll to read output
     let mut output = Vec::new();
@@ -134,16 +163,34 @@ fn test_session_write_and_read() {
     );
 }
 
+/// Poll `session` until the child exit surfaces, draining pending output.
+///
+/// `ConPTY` emits an initial terminal frame when a client connects, so on
+/// Windows a single `poll_pty` after the child exits may still report the
+/// buffered `Data` before the EOF that carries the exit code.
+fn poll_until_exit(session: &mut TerminalSession) -> PollResult {
+    for _ in 0..100 {
+        match session.poll_pty().expect("poll failed") {
+            PollResult::Exited { exit_code } => return PollResult::Exited { exit_code },
+            PollResult::Data(_) | PollResult::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    panic!("child did not exit in time");
+}
+
 #[test]
 fn test_session_exit_detection() {
     // Test that session detects when a short-lived process exits
     let mut session = TerminalSession::new(24, 80);
-    session.spawn_shell("/bin/true").expect("spawn failed");
+    let (program, args) = exit_command(0);
+    session.spawn_command(program, &args).expect("spawn failed");
 
-    // /bin/true exits immediately
+    // The command exits immediately
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let result = session.poll_pty().expect("poll failed");
+    let result = poll_until_exit(&mut session);
     match result {
         PollResult::Exited { exit_code } => {
             assert_eq!(exit_code, 0);
@@ -158,11 +205,12 @@ fn test_session_exit_detection() {
 #[test]
 fn test_session_exit_with_error() {
     let mut session = TerminalSession::new(24, 80);
-    session.spawn_shell("/bin/false").expect("spawn failed");
+    let (program, args) = exit_command(1);
+    session.spawn_command(program, &args).expect("spawn failed");
 
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let result = session.poll_pty().expect("poll failed");
+    let result = poll_until_exit(&mut session);
     match result {
         PollResult::Exited { exit_code } => {
             assert_eq!(exit_code, 1);

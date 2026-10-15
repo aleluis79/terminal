@@ -75,6 +75,14 @@
 - [x] **T014: Implementar PTY para Windows (ConPTY)**
   - RF: RF-25, RF-27, RF-28
   - `terminal_pty/src/win32.rs`: Trait PTY con Windows ConPTY API (CreatePseudoConsole, CreateProcess)
+  - Port real: `CreatePipe` x2 + `CreatePseudoConsole` + `EXTENDED_STARTUPINFO_PRESENT` con
+    `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` (el `lpValue` es el **valor** del `HPCON`, no su
+    direccion; pasar `&hpc` hace que el hijo arranque con `0xc0000142`). `STARTF_USESTDHANDLES`
+    con handles invalidos evita que el hijo herede los std handles del padre y se quede
+    pegado a su consola real. Lecturas no bloqueantes con `PeekNamedPipe` + `GetExitCodeProcess`;
+    resize con `ResizePseudoConsole`.
+  - `terminal_core`: `session.rs` deja de ser `cfg(unix)`; expone el alias `PlatformPty`
+    (UnixPty/WinPty) para que los tests de sesion corran en ambos sistemas.
   - Hecho cuando: spawn cmd.exe en Windows → read/write funciona, Ctrl+C → SIGINT
 
 - [x] **T015: Implementar TerminalSession (PTY + Parser + Buffer)**
@@ -440,6 +448,53 @@
   - `terminal_core/src/parser.rs`: registrar los designadores `ESC ( 0` / `ESC ( B` (G0) y `ESC ) 0` (G1), manejar SO/SI y traducir los caracteres ASCII al glifo Unicode de líneas/símbolos al emitir `Action::Write`
   - Hecho cuando: `printf '\033(0q\033(Bq'` dibuja `─q` y `nmon` muestra líneas en lugar de letras; `cargo test -p terminal_core parser` pasa
 
+- [x] **T082: Configuración de shell (`shell.program`, `shell.args`, `shell.profiles`) (RF-62, RF-64)**
+  - RF: RF-62, RF-64
+  - `terminal_config/src/config.rs`: `ShellConfig`/`ShellProfile` en `Config` (`program` opcional, `args`, `profiles`)
+  - Hecho cuando: un TOML con `[shell]` y `[[shell.profiles]]` se parsea, sobrevive el round-trip y los defaults siguen vacíos
+
+- [x] **T083: Resolución de perfiles y comando por defecto (RF-64, RF-65, CL-26, CL-29)**
+  - RF: RF-64, RF-65, CL-26, CL-29
+  - `terminal_config/src/shell.rs`: `ShellCommand`, `Config::shell_profiles`/`default_shell_command`/`profile_command` y `program_exists` (ruta o PATH + `PATHEXT`)
+  - Hecho cuando: `shell.profiles` vacío produce los perfiles por defecto (cmd/powershell/wsl existentes en Windows; `$SHELL` en Unix), los perfiles inválidos se descartan y `profile_command(n)` devuelve el perfil o `None`
+
+- [x] **T084: Flag `--shell` en la CLI (RF-63)**
+  - RF: RF-63
+  - `terminal_config/src/cli.rs` (`shell: Option<String>` + `merge_cli`) y `terminal/src/main.rs` (parsear la CLI y aplicar `merge_cli` sobre la config)
+  - Hecho cuando: `--shell wsl.exe` sobrescribe `shell.program` y sin el flag la config no cambia
+
+- [x] **T085: PTY con argumentos (RF-62, RF-64, CL-25)**
+  - RF: RF-62, RF-64, CL-25
+  - `terminal_pty/src/pty.rs` (`spawn(program, args)`), `unix.rs` (argv real), `win32.rs` (*command line* citada) y `terminal_core/src/session.rs` (`spawn_command`, `spawn_shell` delega)
+  - Hecho cuando: `spawn("cmd.exe", ["/c","exit","7"])` sale con 7 y un argumento con espacios llega como uno solo
+
+- [x] **T086: Perfiles en runtime con atajos (RF-66)**
+  - RF: RF-66
+  - `terminal_gui/src/keymap.rs`: `GuiAction::NewTabWithProfile(usize)`, `PhysicalBinding` + `resolve_physical` y bindings Ctrl+Shift+1…9 por `KeyCode`; `terminal_gui/src/event.rs`: comprobar el código físico al procesar el evento
+  - Hecho cuando: `resolve_physical(Digit1, Ctrl+Shift)` produce `NewTabWithProfile(0)` y los bindings lógicos de usuario siguen teniendo prioridad
+
+- [x] **T087: Lanzar el perfil elegido y fallback (RF-62, RF-66, RF-67, CL-24, CL-27)**
+  - RF: RF-62, RF-66, RF-67, CL-24, CL-27
+  - `terminal/src/main.rs`: resolver `default_shell`/`shell_profiles` al arrancar, usarlos en `TabState`/splits, añadir el perfil N del atajo (sin abrir pestaña si no existe) y, si el spawn falla, escribir el error visible en el panel y reintentar con la shell por defecto
+  - Hecho cuando: nueva pestaña con Ctrl+Shift+N usa `shell.program`; Ctrl+Shift+N usa el perfil N; un perfil inexistente no abre pestaña; un programa que falla deja el error visible y la shell por defecto
+
+- [x] **T088: Verificación de la selección de shell (RF-62 a RF-67)**
+  - RF: RF-62 a RF-67, CL-24 a CL-29
+  - Ejemplo de `config.toml` con `[[shell.profiles]]` (cmd/powershell/wsl) y prueba manual: atajos por pestaña, `--shell`, y shell inexistente
+  - Hecho cuando: se abre una pestaña de cada perfil, `--shell` cambia la shell y un programa inexistente muestra el error y abre la shell por defecto
+
+- [x] **T089: Codificación de Escape y Supr (RF-68, RF-69, CL-30)**
+  - RF: RF-68, RF-69, CL-30
+  - `terminal_core/src/input.rs` (`KeyEvent::Special`: `Escape` ⇒ `0x1b`, `Delete` ⇒ `ESC[3~` / `ESC[3;N~`) y `terminal_gui/src/event.rs` (actualizar el test/comentario de Escape)
+  - Hecho cuando: `Escape` produce exactamente `[0x1b]` (con o sin modificadores) y `Supr` produce `ESC[3~`, `ESC[3;3~` (Alt), `ESC[3;5~` (Ctrl), `ESC[3;7~` (ambos), sin `ESC[[D` ni `ESC[~`
+
+### Fase 21: Shell heredada al dividir paneles
+
+- [x] **T090: El panel nuevo hereda la shell del panel dividido (RF-70, CL-31)**
+  - RF: RF-70, CL-31
+  - `terminal/src/main.rs`: `PaneState { session, command }`, `TabState.panes` guarda `PaneState`, `spawn_session` devuelve la shell efectiva (petición o *fallback*), `split_active` usa `TabState::split_command`
+  - Hecho cuando: dividir una pestaña abre el panel nuevo con la misma shell que corre en el panel dividido (no con la shell por defecto), y un panel con shell inexistente hereda la shell del sistema que acabó corriendo
+
 ## Resumen
 
 | Fase | Tareas | RFs cubiertos |
@@ -463,5 +518,8 @@
 | 16: Pestaña activa y botón × | T078-T079 | RF-58, RF-59 |
 | 17: Identidad e icono | T080 | RF-60 |
 | 18: Juego de caracteres DEC | T081 | RF-61, CL-23 |
+| 19: Selección de shell | T082-T088 | RF-62 a RF-67, CL-24 a CL-29 |
+| 20: Codificación de teclas especiales | T089 | RF-68, RF-69, CL-30 |
+| 21: Shell heredada al dividir paneles | T090 | RF-70, CL-31 |
 
-**Total: 81 tareas**
+**Total: 90 tareas**

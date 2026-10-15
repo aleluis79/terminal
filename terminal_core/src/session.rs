@@ -12,8 +12,9 @@
 //! ```
 
 #[cfg(unix)]
-use terminal_pty::unix::UnixPty;
-#[cfg(unix)]
+pub use terminal_pty::unix::UnixPty as PlatformPty;
+#[cfg(windows)]
+pub use terminal_pty::win32::WinPty as PlatformPty;
 use terminal_pty::Pty;
 
 use crate::engine::TerminalEngine;
@@ -61,8 +62,7 @@ pub struct TerminalSession {
     /// The terminal engine (parser + buffer + state).
     engine: TerminalEngine,
     /// The PTY for I/O with the shell process.
-    #[cfg(unix)]
-    pty: Option<UnixPty>,
+    pty: Option<PlatformPty>,
     /// Whether the session is still running.
     running: bool,
     /// The exit code, if the session has exited.
@@ -80,7 +80,6 @@ impl TerminalSession {
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
             engine: TerminalEngine::new(rows, cols),
-            #[cfg(unix)]
             pty: None,
             running: true,
             exit_code: None,
@@ -96,9 +95,24 @@ impl TerminalSession {
     /// # Errors
     ///
     /// Returns an error if the PTY cannot be created or the shell cannot be spawned.
-    #[cfg(unix)]
     pub fn spawn_shell(&mut self, shell: &str) -> Result<(), terminal_pty::PtyError> {
-        let pty = UnixPty::spawn(shell)?;
+        self.spawn_command(shell, &[])
+    }
+
+    /// Spawn a program with explicit arguments on a new PTY (RF-62).
+    ///
+    /// The arguments are passed as separate entries, so they are never
+    /// re-interpreted by an intermediate shell (CL-25).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PTY cannot be created or the program cannot be spawned.
+    pub fn spawn_command(
+        &mut self,
+        program: &str,
+        args: &[String],
+    ) -> Result<(), terminal_pty::PtyError> {
+        let pty = PlatformPty::spawn(program, args)?;
         self.pty = Some(pty);
         // Tell the shell the real terminal size before it draws anything.
         let (rows, cols) = self.engine.dimensions();
@@ -113,14 +127,11 @@ impl TerminalSession {
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.engine.resize(rows, cols);
 
-        #[cfg(unix)]
-        {
-            let (rows, cols) = self.engine.dimensions();
-            let rows = u16::try_from(rows).unwrap_or(u16::MAX);
-            let cols = u16::try_from(cols).unwrap_or(u16::MAX);
-            if let Some(pty) = self.pty.as_mut() {
-                let _ = pty.resize(rows, cols);
-            }
+        let (rows, cols) = self.engine.dimensions();
+        let rows = u16::try_from(rows).unwrap_or(u16::MAX);
+        let cols = u16::try_from(cols).unwrap_or(u16::MAX);
+        if let Some(pty) = self.pty.as_mut() {
+            let _ = pty.resize(rows, cols);
         }
     }
 
@@ -156,7 +167,6 @@ impl TerminalSession {
     /// # Errors
     ///
     /// Returns an error if a read error occurs (other than EAGAIN/EWOULDBLOCK).
-    #[cfg(unix)]
     pub fn poll_pty(&mut self) -> Result<PollResult, terminal_pty::PtyError> {
         let Some(pty) = self.pty.as_mut() else {
             return Ok(PollResult::WouldBlock);
@@ -191,7 +201,6 @@ impl TerminalSession {
     /// # Errors
     ///
     /// Returns an error if the write to the PTY fails.
-    #[cfg(unix)]
     pub fn write_to_shell(&mut self, buf: &[u8]) -> Result<usize, terminal_pty::PtyError> {
         match self.pty.as_mut() {
             Some(pty) => pty.write(buf),
@@ -200,7 +209,6 @@ impl TerminalSession {
     }
 
     /// Send SIGINT (Ctrl+C) to the shell process.
-    #[cfg(unix)]
     pub fn send_interrupt(&self) {
         if let Some(pty) = &self.pty {
             pty.send_interrupt();
@@ -208,7 +216,6 @@ impl TerminalSession {
     }
 
     /// Send EOF (Ctrl+D) to the shell process.
-    #[cfg(unix)]
     pub fn send_eof(&mut self) {
         if let Some(pty) = self.pty.as_mut() {
             pty.send_eof();
@@ -223,7 +230,6 @@ impl TerminalSession {
     /// # Errors
     ///
     /// Returns an error if `waitpid` fails with an unexpected error.
-    #[cfg(unix)]
     pub fn check_exit(&mut self) -> Result<Option<i32>, terminal_pty::PtyError> {
         match self.pty.as_mut() {
             Some(pty) => {
@@ -245,7 +251,6 @@ impl TerminalSession {
     /// # Errors
     ///
     /// Returns an error if `waitpid` fails with an unexpected error.
-    #[cfg(unix)]
     pub fn wait(&mut self) -> Result<Option<i32>, terminal_pty::PtyError> {
         match self.pty.as_mut() {
             Some(pty) => {
@@ -261,7 +266,6 @@ impl TerminalSession {
     }
 
     /// Get the PID of the shell process.
-    #[cfg(unix)]
     pub fn pid(&self) -> Option<u32> {
         self.pty.as_ref().and_then(terminal_pty::Pty::pid)
     }
@@ -325,6 +329,63 @@ impl TerminalSession {
 mod tests {
     use super::*;
 
+    /// Interactive shell used by the PTY tests on this platform.
+    #[cfg(unix)]
+    const TEST_SHELL: &str = "/bin/bash";
+    #[cfg(windows)]
+    const TEST_SHELL: &str = "cmd.exe";
+
+    /// Program and arguments that exit immediately with the given code (RF-62).
+    #[cfg(unix)]
+    fn exit_command(code: i32) -> (&'static str, Vec<String>) {
+        let program = if code == 0 { "/bin/true" } else { "/bin/false" };
+        (program, Vec::new())
+    }
+
+    /// Program and arguments that exit immediately with the given code (RF-62).
+    #[cfg(windows)]
+    fn exit_command(code: i32) -> (&'static str, Vec<String>) {
+        (
+            "cmd.exe",
+            vec!["/c".to_string(), "exit".to_string(), code.to_string()],
+        )
+    }
+
+    /// Program and arguments that print something and exit (RF-62).
+    #[cfg(unix)]
+    fn echo_command() -> (&'static str, Vec<String>) {
+        ("/bin/echo", Vec::new())
+    }
+
+    /// Program and arguments that print something and exit (RF-62).
+    #[cfg(windows)]
+    fn echo_command() -> (&'static str, Vec<String>) {
+        ("cmd.exe", vec!["/c".to_string(), "echo".to_string()])
+    }
+
+    /// Line terminator the shell treats as "Enter".
+    #[cfg(unix)]
+    const TEST_ENTER: &str = "\n";
+    #[cfg(windows)]
+    const TEST_ENTER: &str = "\r";
+
+    /// Poll `session` until the child exit surfaces, draining pending output.
+    ///
+    /// `ConPTY` emits an initial terminal frame when a client connects, so on
+    /// Windows a single `poll_pty` after the child exits may still report the
+    /// buffered `Data` before the EOF that carries the exit code.
+    fn poll_until_exit(session: &mut TerminalSession) -> PollResult {
+        for _ in 0..100 {
+            match session.poll_pty().expect("poll failed") {
+                PollResult::Exited { exit_code } => return PollResult::Exited { exit_code },
+                PollResult::Data(_) | PollResult::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        panic!("child did not exit in time");
+    }
+
     #[test]
     fn test_session_queues_gui_query_actions() {
         // RF-51: queries parsed out of the PTY stream must surface to the GUI
@@ -334,7 +395,7 @@ mod tests {
         let actions = session.take_gui_actions();
         assert!(actions.contains(&Action::QueryCursorPosition));
         // Draining leaves the queue empty.
-        assert!(session.take_gui_actions().is_empty());
+        assert_eq!(session.take_gui_actions(), Vec::<Action>::new());
     }
 
     #[test]
@@ -379,22 +440,38 @@ mod tests {
     #[test]
     fn test_session_spawn_shell() {
         let mut session = TerminalSession::new(24, 80);
-        assert!(session.spawn_shell("/bin/bash").is_ok());
+        assert!(session.spawn_shell(TEST_SHELL).is_ok());
         assert!(session.pid().is_some());
         assert!(session.is_running());
     }
 
     #[test]
+    fn test_session_spawn_command_with_arguments() {
+        // RF-62: a program plus explicit arguments can be spawned.
+        let mut session = TerminalSession::new(24, 80);
+        let (program, args) = exit_command(0);
+        assert!(session.spawn_command(program, &args).is_ok());
+        assert!(session.is_running());
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            poll_until_exit(&mut session),
+            PollResult::Exited { exit_code: 0 }
+        );
+    }
+
+    #[test]
     fn test_session_write_to_shell() {
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/bash").expect("spawn failed");
+        session.spawn_shell(TEST_SHELL).expect("spawn failed");
 
         // Give the shell time to start
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // Write a command
+        let command = format!("echo hello{TEST_ENTER}");
         let written = session
-            .write_to_shell(b"echo hello\n")
+            .write_to_shell(command.as_bytes())
             .expect("write failed");
         assert!(written > 0);
 
@@ -426,7 +503,7 @@ mod tests {
     #[test]
     fn test_session_interrupt() {
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/bash").expect("spawn failed");
+        session.spawn_shell(TEST_SHELL).expect("spawn failed");
 
         // Send interrupt
         session.send_interrupt();
@@ -439,9 +516,10 @@ mod tests {
     #[test]
     fn test_session_wait_exited() {
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/true").expect("spawn failed");
+        let (program, args) = exit_command(0);
+        session.spawn_command(program, &args).expect("spawn failed");
 
-        // /bin/true exits immediately
+        // The command exits immediately
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let status = session.wait().expect("wait failed");
@@ -453,7 +531,7 @@ mod tests {
     #[test]
     fn test_session_poll_pty() {
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/bash").expect("spawn failed");
+        session.spawn_shell(TEST_SHELL).expect("spawn failed");
 
         // Give the shell time to start
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -490,13 +568,14 @@ mod tests {
     fn test_session_poll_exited_process() {
         // Test that poll_pty returns PollResult::Exited when the child process exits
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/true").expect("spawn failed");
+        let (program, args) = exit_command(0);
+        session.spawn_command(program, &args).expect("spawn failed");
 
-        // /bin/true exits immediately, wait for it
+        // The command exits immediately, wait for it
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         // poll_pty should detect the exit
-        let result = session.poll_pty().expect("poll failed");
+        let result = poll_until_exit(&mut session);
         match result {
             PollResult::Exited { exit_code } => {
                 assert_eq!(exit_code, 0);
@@ -517,12 +596,13 @@ mod tests {
     fn test_session_poll_exited_with_error_code() {
         // Test that poll_pty returns the correct exit code when child exits with error
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/false").expect("spawn failed");
+        let (program, args) = exit_command(1);
+        session.spawn_command(program, &args).expect("spawn failed");
 
-        // /bin/false exits immediately with code 1
+        // The command exits immediately with code 1
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        let result = session.poll_pty().expect("poll failed");
+        let result = poll_until_exit(&mut session);
         match result {
             PollResult::Exited { exit_code } => {
                 assert_eq!(exit_code, 1);
@@ -540,7 +620,8 @@ mod tests {
         // Regression: once the child's last output has been read, the session
         // must still report the exit instead of getting stuck on WouldBlock.
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/echo").expect("spawn failed");
+        let (program, args) = echo_command();
+        session.spawn_command(program, &args).expect("spawn failed");
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let mut exit_code = None;
@@ -564,7 +645,7 @@ mod tests {
     fn test_session_exit_code_before_exit() {
         // Test that exit_code() returns None before the process exits
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/bash").expect("spawn failed");
+        session.spawn_shell(TEST_SHELL).expect("spawn failed");
 
         assert!(session.exit_code().is_none());
         assert!(session.session_event().is_none());
@@ -574,7 +655,8 @@ mod tests {
     fn test_session_check_exit_updates_code() {
         // Test that check_exit() updates the internal exit_code
         let mut session = TerminalSession::new(24, 80);
-        session.spawn_shell("/bin/true").expect("spawn failed");
+        let (program, args) = exit_command(0);
+        session.spawn_command(program, &args).expect("spawn failed");
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 

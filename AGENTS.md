@@ -34,7 +34,7 @@ Dependency direction: `terminal_core` ← `terminal_render` ← `terminal_gui` �
 ## Gotchas
 
 - Root `Cargo.toml` sets `warnings = "deny"` and clippy `pedantic` for the whole workspace: any warning fails build/CI, and all public items need doc comments.
-- Integration tests (`terminal/tests/integration.rs`) spawn real PTYs (`/bin/bash`, `/bin/true`, `/bin/false`) with `sleep`-based polling — Unix-only and slightly slow by design. This is why macOS CI runs `cargo test --workspace --lib`.
+- Integration tests (`terminal/tests/integration.rs`) and `terminal_core`'s session tests spawn real PTYs (bash on Unix, `cmd.exe` on Windows, chosen by per-module `TEST_*` constants) with `sleep`-based polling - slow by design and flaky on busy runners. This is why macOS CI runs `cargo test --workspace --lib`.
 - The `terminal` binary picks its shell from `$SHELL` (Unix) / `%COMSPEC%` (Windows) in `main.rs::default_shell()`, falling back to `/bin/bash` / `cmd.exe`.
 - GPU base (wgpu instance/device) is intentionally initialized before the winit event loop (fixes invisible window on Wayland). Do not refactor this away.
 - Config lives at `$XDG_CONFIG_HOME/terminal/config.toml` (Linux) / `%APPDATA%\terminal\config.toml` (Windows); a missing file silently falls back to defaults.

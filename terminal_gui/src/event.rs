@@ -12,7 +12,7 @@
 //! ```
 
 use winit::event::{ElementState, KeyEvent, MouseButton};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 use terminal_core::grid::Grid;
 use terminal_core::input::{ArrowDirection, KeyEvent as TerminalKeyEvent, SpecialKey};
@@ -372,7 +372,11 @@ impl EventProcessor {
     /// `Some(TerminalInput)` for terminal input,
     /// or `None` if the event was not handled.
     pub fn process_key_event(&self, event: &KeyEvent) -> Option<EventResult> {
-        self.process_key(&event.logical_key, event.state)
+        let code = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
+            PhysicalKey::Unidentified(_) => None,
+        };
+        self.process_key_with_code(&event.logical_key, code, event.state)
     }
 
     /// Resolve a key press/release into a GUI action or terminal input.
@@ -383,6 +387,20 @@ impl EventProcessor {
     /// Split out from [`process_key_event`](Self::process_key_event) so it can
     /// be exercised without constructing a winit `KeyEvent`.
     pub fn process_key(&self, key: &Key, state: ElementState) -> Option<EventResult> {
+        self.process_key_with_code(key, None, state)
+    }
+
+    /// Resolve a key press/release, also considering its physical key.
+    ///
+    /// Logical bindings (user config plus defaults) are checked first;
+    /// physical ones — needed for layout-independent shortcuts such as
+    /// `Ctrl+Shift+1` (RF-66) — only when nothing matched.
+    pub fn process_key_with_code(
+        &self,
+        key: &Key,
+        code: Option<KeyCode>,
+        state: ElementState,
+    ) -> Option<EventResult> {
         if state != ElementState::Pressed {
             return None;
         }
@@ -391,6 +409,13 @@ impl EventProcessor {
         let gui_action = self.keymap.resolve(key, &self.modifiers);
         if gui_action != GuiAction::None {
             return Some(EventResult::GuiAction(gui_action));
+        }
+
+        if let Some(code) = code {
+            let gui_action = self.keymap.resolve_physical(code, &self.modifiers);
+            if gui_action != GuiAction::None {
+                return Some(EventResult::GuiAction(gui_action));
+            }
         }
 
         let terminal_event = Self::key_to_terminal_event(key, self.modifiers)?;
@@ -679,6 +704,46 @@ mod tests {
     }
 
     #[test]
+    fn test_physical_profile_shortcut() {
+        // RF-66: Ctrl+Shift+1 opens profile 0 even though the logical key is a
+        // shifted digit (`!` on most layouts).
+        let mut processor = EventProcessor::new();
+        processor.update_modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+
+        assert!(matches!(
+            processor.process_key_with_code(
+                &Key::Character("!".into()),
+                Some(KeyCode::Digit1),
+                ElementState::Pressed
+            ),
+            Some(EventResult::GuiAction(GuiAction::NewTabWithProfile(0)))
+        ));
+    }
+
+    #[test]
+    fn test_logical_custom_binding_wins_over_physical() {
+        // A user binding the same chord logically still wins.
+        let mut processor = EventProcessor::new();
+        processor.update_modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+        processor.add_binding(crate::keymap::KeyBinding {
+            key: crate::keymap::KeyCombination::new(
+                "!",
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ),
+            action: GuiAction::CloseTab,
+        });
+
+        assert!(matches!(
+            processor.process_key_with_code(
+                &Key::Character("!".into()),
+                Some(KeyCode::Digit1),
+                ElementState::Pressed
+            ),
+            Some(EventResult::GuiAction(GuiAction::CloseTab))
+        ));
+    }
+
+    #[test]
     fn test_release_does_not_trigger_action() {
         // Regression: a shortcut must fire once per press, not also on release
         // (which opened two tabs / closed two).
@@ -708,9 +773,9 @@ mod tests {
             EventProcessor::key_to_terminal_event(&Key::Named(NamedKey::Escape), modifiers);
         assert!(result.is_some());
         let event = result.unwrap();
-        // Note: Escape is handled as a special key that produces ESC [ D in key_event_to_bytes
+        // RF-68: Escape is a bare `ESC` byte.
         let bytes = terminal_core::input::key_event_to_bytes(&event);
-        assert!(!bytes.is_empty());
+        assert_eq!(bytes, vec![0x1b]);
     }
 
     #[test]
@@ -721,7 +786,7 @@ mod tests {
         assert!(result.is_some());
         let event = result.unwrap();
         let bytes = terminal_core::input::key_event_to_bytes(&event);
-        assert_eq!(bytes, vec![0x08]);
+        assert_eq!(bytes, vec![0x7f]);
     }
 
     #[test]
@@ -732,6 +797,18 @@ mod tests {
         let event = result.unwrap();
         let bytes = terminal_core::input::key_event_to_bytes(&event);
         assert_eq!(bytes, vec![0x09]);
+    }
+
+    #[test]
+    fn test_key_to_terminal_delete() {
+        // RF-69: Supr reaches the child process as `ESC[3~`.
+        let modifiers = ModifiersState::default();
+        let result =
+            EventProcessor::key_to_terminal_event(&Key::Named(NamedKey::Delete), modifiers);
+        assert!(result.is_some());
+        let event = result.unwrap();
+        let bytes = terminal_core::input::key_event_to_bytes(&event);
+        assert_eq!(bytes, b"\x1b[3~".to_vec());
     }
 
     #[test]

@@ -318,7 +318,7 @@ mod tests {
         let font = FontHandle::new(&config);
         // Font should have a valid face ID (display is non-zero)
         let id_str = format!("{}", font.face_id);
-        assert!(!id_str.is_empty());
+        assert_ne!(id_str, "");
         assert!((font.size - 14.0).abs() < f32::EPSILON);
     }
 

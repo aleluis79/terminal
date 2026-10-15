@@ -123,7 +123,9 @@ impl GlyphRenderer {
                 swash::scale::image::Content::Mask => image.data,
                 _ => image
                     .data
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|px| px[0].max(px[1]).max(px[2]).max(px[3]))
                     .collect(),
             };

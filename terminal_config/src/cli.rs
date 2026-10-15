@@ -28,6 +28,18 @@ pub struct Cli {
     /// Window opacity (0.0-1.0).
     #[arg(long, value_name = "OPACITY")]
     pub opacity: Option<f32>,
+
+    /// Shell program to run for new sessions (overrides `shell.program`) (RF-63).
+    #[arg(long, value_name = "PROGRAM")]
+    pub shell: Option<String>,
+}
+
+/// Parse the process arguments.
+///
+/// Exits the process on `--help`, `--version` or invalid arguments.
+#[must_use]
+pub fn parse() -> Cli {
+    Cli::parse()
 }
 
 /// Merge CLI arguments into config (CLI overrides config file).
@@ -48,6 +60,9 @@ pub fn merge_cli(config: Config, cli: &Cli) -> Config {
     }
     if let Some(opacity) = cli.opacity {
         config.window.opacity = opacity;
+    }
+    if let Some(shell) = &cli.shell {
+        config.shell.program = Some(shell.clone());
     }
 
     config
@@ -116,5 +131,26 @@ mod tests {
         let cli = Cli::parse_from(["terminal", "--opacity", "0.8"]);
         let merged = merge_cli(config, &cli);
         assert!((merged.window.opacity - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_merge_cli_shell_override() {
+        // RF-63: `--shell` replaces `shell.program`.
+        let mut config = Config::default();
+        config.shell.program = Some("cmd.exe".to_string());
+
+        let cli = Cli::parse_from(["terminal", "--shell", "wsl.exe"]);
+        let merged = merge_cli(config, &cli);
+        assert_eq!(merged.shell.program.as_deref(), Some("wsl.exe"));
+    }
+
+    #[test]
+    fn test_merge_cli_shell_absent_keeps_config() {
+        let mut config = Config::default();
+        config.shell.program = Some("cmd.exe".to_string());
+
+        let cli = Cli::parse_from(["terminal"]);
+        let merged = merge_cli(config, &cli);
+        assert_eq!(merged.shell.program.as_deref(), Some("cmd.exe"));
     }
 }

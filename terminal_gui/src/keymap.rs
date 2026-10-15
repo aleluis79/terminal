@@ -18,6 +18,8 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey};
 pub enum GuiAction {
     /// Create a new tab.
     NewTab,
+    /// Create a new tab running shell profile `n` (RF-66).
+    NewTabWithProfile(usize),
     /// Close the active tab.
     CloseTab,
     /// Switch to the next tab.
@@ -98,16 +100,38 @@ impl KeyCombination {
     }
 }
 
+/// A binding anchored to a physical key.
+///
+/// Physical bindings are independent of the keyboard layout: pressing the key
+/// that produces `Shift`+`1` on a US layout and `Shift`+`1` on a Spanish one
+/// are the same physical key, while their logical characters (`!` in both)
+/// differ across layouts. Used for shortcuts that must not depend on which
+/// character the layout produces (RF-66).
+#[derive(Debug, Clone)]
+pub struct PhysicalBinding {
+    /// The physical key code.
+    pub code: KeyCode,
+    /// Required modifier state (bitmask).
+    pub modifiers: u64,
+    /// The action to perform.
+    pub action: GuiAction,
+}
+
 /// Keyboard binding manager.
 ///
 /// Resolves key events to GUI actions using default bindings
 /// or custom bindings from configuration.
+// The three binding sets are parallel by design; the shared `_bindings`
+// suffix keeps them readable together.
+#[expect(clippy::struct_field_names)]
 #[derive(Debug)]
 pub struct Keymap {
     /// Custom bindings (from config).
     custom_bindings: Vec<KeyBinding>,
     /// Default bindings.
     default_bindings: Vec<KeyBinding>,
+    /// Default bindings keyed by physical code (RF-66).
+    physical_bindings: Vec<PhysicalBinding>,
 }
 
 impl Default for Keymap {
@@ -123,6 +147,7 @@ impl Keymap {
         Self {
             custom_bindings: Vec::new(),
             default_bindings,
+            physical_bindings: Self::build_physical_bindings(),
         }
     }
 
@@ -152,9 +177,29 @@ impl Keymap {
         GuiAction::None
     }
 
+    /// Resolve a *physical* key to a GUI action (RF-66).
+    ///
+    /// Logical custom bindings win: only when [`resolve`](Self::resolve) found
+    /// nothing does this run, so a user rebinding the same chord still wins.
+    pub fn resolve_physical(&self, code: KeyCode, modifiers: &ModifiersState) -> GuiAction {
+        let bits = u64::from(modifiers.bits());
+        for binding in &self.physical_bindings {
+            if binding.code == code && binding.modifiers == bits {
+                return binding.action;
+            }
+        }
+
+        GuiAction::None
+    }
+
     /// Get the default bindings.
     pub fn default_bindings(&self) -> &[KeyBinding] {
         &self.default_bindings
+    }
+
+    /// Get the default physical bindings.
+    pub fn default_physical_bindings(&self) -> &[PhysicalBinding] {
+        &self.physical_bindings
     }
 
     /// Get the custom bindings.
@@ -253,6 +298,37 @@ impl Keymap {
             },
         ]
     }
+
+    /// Build the default physical bindings (RF-66).
+    ///
+    /// `Ctrl+Shift+1` … `Ctrl+Shift+9` open the corresponding shell profile.
+    /// They are keyed by physical code because with `Shift` held the logical
+    /// character is a shifted digit (`!`, `"`, `·`, …), which depends on the
+    /// keyboard layout.
+    fn build_physical_bindings() -> Vec<PhysicalBinding> {
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let digits = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ];
+
+        digits
+            .into_iter()
+            .enumerate()
+            .map(|(index, code)| PhysicalBinding {
+                code,
+                modifiers: u64::from(ctrl_shift.bits()),
+                action: GuiAction::NewTabWithProfile(index),
+            })
+            .collect()
+    }
 }
 
 impl KeyCombination {
@@ -311,6 +387,15 @@ pub fn key_code_to_key(code: KeyCode) -> String {
         KeyCode::PageDown => "pagedown".to_string(),
         KeyCode::Home => "home".to_string(),
         KeyCode::End => "end".to_string(),
+        KeyCode::Digit1 => "1".to_string(),
+        KeyCode::Digit2 => "2".to_string(),
+        KeyCode::Digit3 => "3".to_string(),
+        KeyCode::Digit4 => "4".to_string(),
+        KeyCode::Digit5 => "5".to_string(),
+        KeyCode::Digit6 => "6".to_string(),
+        KeyCode::Digit7 => "7".to_string(),
+        KeyCode::Digit8 => "8".to_string(),
+        KeyCode::Digit9 => "9".to_string(),
         _ => String::new(),
     }
 }
@@ -443,6 +528,43 @@ mod tests {
         assert_eq!(key_code_to_key(KeyCode::ArrowUp), "up");
         assert_eq!(key_code_to_key(KeyCode::ArrowLeft), "left");
         assert_eq!(key_code_to_key(KeyCode::Tab), "Tab");
+        assert_eq!(key_code_to_key(KeyCode::Digit1), "1");
+    }
+
+    #[test]
+    fn test_physical_profile_shortcuts() {
+        // RF-66: Ctrl+Shift+1..9 open shell profiles 0..8.
+        let keymap = Keymap::default();
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        assert_eq!(
+            keymap.resolve_physical(KeyCode::Digit1, &ctrl_shift),
+            GuiAction::NewTabWithProfile(0)
+        );
+        assert_eq!(
+            keymap.resolve_physical(KeyCode::Digit9, &ctrl_shift),
+            GuiAction::NewTabWithProfile(8)
+        );
+    }
+
+    #[test]
+    fn test_physical_shortcuts_need_ctrl_shift() {
+        let keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.resolve_physical(KeyCode::Digit1, &ModifiersState::CONTROL),
+            GuiAction::None
+        );
+        assert_eq!(
+            keymap.resolve_physical(KeyCode::Digit0, &ModifiersState::empty()),
+            GuiAction::None
+        );
+    }
+
+    #[test]
+    fn test_default_physical_bindings_cover_digits_one_to_nine() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.default_physical_bindings().len(), 9);
     }
 
     #[test]

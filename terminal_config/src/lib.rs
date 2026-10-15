@@ -17,6 +17,9 @@ pub mod loader;
 /// CLI argument parser.
 pub mod cli;
 
+/// Shell profile resolution.
+pub mod shell;
+
 /// Configuration error types.
 pub mod error;
 

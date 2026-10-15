@@ -10,19 +10,26 @@ use crate::error::ConfigError;
 
 /// Find the configuration file path.
 ///
-/// Linux: `$XDG_CONFIG_HOME/terminal/config.toml`
-/// Windows: `%APPDATA%\terminal\config.toml`
+/// Linux: `$XDG_CONFIG_HOME/terminal/config.toml`, falling back to
+/// `$HOME/.config/terminal/config.toml`.
+/// Windows: `%APPDATA%\terminal\config.toml`.
 ///
 /// # Panics
 ///
-/// Panics if neither `XDG_CONFIG_HOME` nor `HOME` environment variables are set.
+/// Panics if the environment variables that make up the config directory are
+/// missing: `APPDATA` on Windows, `XDG_CONFIG_HOME`/`HOME` on Unix.
 pub fn find_config_path() -> PathBuf {
+    #[cfg(windows)]
+    let config_dir = PathBuf::from(std::env::var("APPDATA").expect("APPDATA not set"));
+
+    #[cfg(not(windows))]
     let config_dir = if let Ok(val) = std::env::var("XDG_CONFIG_HOME") {
         PathBuf::from(val)
     } else {
         let home = std::env::var("HOME").expect("HOME not set");
         PathBuf::from(home).join(".config")
     };
+
     config_dir.join("terminal").join("config.toml")
 }
 

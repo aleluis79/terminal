@@ -169,7 +169,7 @@ fn main() {
     let mut ppm = Vec::with_capacity((width * height * 3) as usize + 32);
     write!(ppm, "P6\n{width} {height}\n255\n").unwrap();
     for row in data.chunks_exact(bytes_per_row as usize) {
-        for px in row[..unpadded as usize].chunks_exact(4) {
+        for px in row[..unpadded as usize].as_chunks::<4>().0 {
             ppm.extend_from_slice(&px[..3]);
         }
     }

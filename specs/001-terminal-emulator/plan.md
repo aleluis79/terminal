@@ -635,6 +635,183 @@ Tests: verificación manual: `WAYLAND_DEBUG=1` muestra
 `xdg_toplevel.set_app_id("terminal")`; `desktop-file-validate` acepta la
 entrada.
 
+## 11. Selección de shell (RF-62 a RF-67)
+
+Origen: el binario lanzaba siempre `$SHELL` (Unix) o `%COMSPEC%` (Windows), sin
+forma de elegir otra shell. Se añade configuración (`shell.program`/`shell.args`
+y una lista de perfiles) más atajos para abrir una pestaña con un perfil
+concreto, con *fallback* a la shell por defecto si el programa falla.
+
+### 11.1. Estructura de módulos
+
+| Módulo | Responsabilidad | RF |
+|--------|-----------------|----|
+| `terminal_config::config` | `ShellConfig` (`shell.program`, `shell.args`, `shell.profiles[]`) dentro de `Config` | RF-62, RF-64 |
+| `terminal_config::shell` | Resolución pura: perfiles efectivos, comando por defecto/perfil N y `program_exists` (búsqueda en `PATH`) | RF-64, RF-65, CL-26, CL-29 |
+| `terminal_config::cli` | `--shell` sobrescribe `shell.program` | RF-63 |
+| `terminal_pty::pty`/`unix`/`win32` | `spawn(program, args)`: pasar argumentos al proceso (argv real en Unix; *command line* citada en ConPTY) | RF-62, RF-64, CL-25 |
+| `terminal_core::session` | `spawn_command(program, args)`; `spawn_shell` delega con argumentos vacíos | RF-62 |
+| `terminal_gui::keymap` | `GuiAction::NewTabWithProfile(usize)` + bindings por defecto Ctrl+Shift+1…9 | RF-66 |
+| `terminal/src/main.rs` | Resuelve el comando (perfil por defecto, perfil N del atajo), lanza la sesión y aplica el *fallback* visible | RF-62 a RF-67, CL-24, CL-27 |
+
+### 11.2. Modelo de datos
+
+```rust
+// terminal_config/src/config.rs — RF-62, RF-64
+pub struct ShellConfig {
+    pub program: Option<String>,      // shell por defecto (None = shell del sistema)
+    pub args: Vec<String>,
+    pub profiles: Vec<ShellProfile>,  // perfiles elegibles
+}
+pub struct ShellProfile {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+// terminal_config/src/shell.rs — RF-64, RF-65
+pub struct ShellCommand {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+impl Config {
+    pub fn shell_profiles(&self) -> Vec<ShellProfile>;    // configurados, o por defecto
+    pub fn default_shell_command(&self) -> ShellCommand;  // program/args, o perfil 0
+    pub fn profile_command(&self, index: usize) -> Option<ShellCommand>;
+}
+pub fn program_exists(program: &str) -> bool;             // ruta explícita o PATH (+PATHEXT)
+
+// terminal_gui/src/keymap.rs — RF-66
+pub enum GuiAction { /* …existentes… */ NewTabWithProfile(usize) }
+struct PhysicalBinding { code: KeyCode, modifiers: u64, action: GuiAction }
+```
+
+Reglas de resolución: `shell.profiles` no vacío ⇒ esos perfiles (se descartan
+los que no tengan `name`/`program`, CL-26); vacío ⇒ perfiles por defecto
+(Windows: `cmd`, `powershell`, `wsl` de los que existan; otros: `$SHELL`).
+`shell.program` tiene prioridad como shell del perfil por defecto (RF-62). El
+perfil N del atajo es `shell_profiles()[N]`; si no existe, no se abre pestaña
+(CL-27).
+
+Persistencia: la misma `config.toml` (secciones `[shell]` y
+`[[shell.profiles]]`); sin estado nuevo.
+
+### 11.3. Decisiones justificadas
+
+| Tema | Decisión | Alternativa descartada | Razón |
+|------|----------|------------------------|-------|
+| Dónde vive la resolución | `terminal_config::shell`, puro y sin GUI | en `terminal/src/main.rs` | Testeable sin GPU ni PTY (constitución 4); el binario queda fino |
+| Modelo | lista de perfiles `name/program/args` (estilo Windows Terminal) | una única shell configurable | RF-64/RF-65 piden elegir entre cmd/powershell/wsl |
+| Perfiles por defecto | autodetectados en Windows si `shell.profiles` está vacío | exigir configuración manual | Que funcione sin escribir config (RF-65) |
+| Existencia de programa | búsqueda en `PATH` (con `PATHEXT` en Windows) | asumir que existe | RF-65/CL-29: ofrecer solo los que existen |
+| Argumentos | `Vec<String>` con `argv` real | interpolar `"prog args"` en una sola cadena | Evita reinterpretación (CL-25) y problemas de *quoting* |
+| Comando por defecto | `shell.program`+`args` si está; si no, perfil 0 | solo perfiles | RF-62 es independiente de la lista de perfiles |
+| Atajo por perfil | Ctrl+Shift+1…9 resueltos por **código físico** (`KeyCode::DigitN`) | por `Key` lógico | Con Shift, `Key::Character` es el símbolo de la distribución (`!`, `"`, …) y el atajo se rompería; el código físico es independiente del *layout* |
+| Precedencia de bindings | lógicos (config RF-43 + defaults) primero; físicos después | físicos primero | Los bindings de usuario siguen ganando |
+| Sesión dividida | hereda la shell del panel dividido (RF-70) | usar el perfil por defecto | El usuario quiere conservar la shell al dividir; ver §13 |
+| Fallback | `spawn` falla ⇒ línea de error visible en el panel + shell por defecto | dejar la pestaña sin sesión | RF-67 y CL-24 ("sin dejar la pestaña vacía") |
+
+### 11.4. Estrategia de tests
+
+| RF / CL | Tipo | Casos |
+|---------|------|-------|
+| RF-62 | Unit (`config`) | `[shell] program/args` se parsean y sobreviven el *round-trip* TOML |
+| RF-63 | Unit (`config::cli`) | `--shell` sobrescribe `shell.program`; sin el flag no cambia |
+| RF-64 | Unit (`config::shell`) | perfiles configurados ⇒ esos; `shell.profiles` vacío ⇒ por defecto; `profile_command(n)` |
+| RF-65 | Unit (`config::shell`) | solo se ofrecen los programas existentes; sin perfiles, el por defecto es `$SHELL`/`%COMSPEC%` |
+| CL-26 | Unit (`config::shell`) | perfil sin `name` o sin `program` se descarta |
+| CL-29 | Unit (`config::shell`) | `program_exists("wsl.exe")` falso cuando no está; no se ofrece el perfil |
+| RF-62/64, CL-25 | Unit (`pty`) | `spawn(program, args)` ejecuta con argumentos (Windows: `cmd /c echo`); args con espacios llegan como un argumento |
+| RF-66 | Unit (`gui::keymap`) | `resolve_physical(Digit1, Ctrl+Shift)` ⇒ `NewTabWithProfile(0)`; el binding físico no depende del *layout* |
+| RF-67, CL-24, CL-27 | Manual / Integration | atajo de un perfil inexistente no abre pestaña; `--shell programa-inexistente` muestra el error y abre la shell por defecto |
+| RF-62 a RF-67 | Manual | `--shell wsl.exe`, `[[shell.profiles]]` con cmd/powershell/wsl y pestañas por atajo |
+
+## 12. Codificación de teclas especiales (RF-68, RF-69)
+
+### 12.1. Estructura de módulos
+
+| Módulo | Cambio |
+|--------|--------|
+| `terminal_core/src/input.rs` | `KeyEvent::Special`: `Escape` devuelve `0x1b`; `Delete` construye `ESC[3~` (o `ESC[3;N~`) |
+| `terminal_gui/src/event.rs` | Solo tests/comentarios: `key_to_terminal_event` ya traduce `NamedKey::{Escape, Delete}` |
+
+### 12.2. Modelo de datos
+
+Sin estructuras nuevas: el modelo sigue siendo `KeyEvent::Special { key, ctrl, alt }` y `key_event_to_bytes` es una función pura `KeyEvent -> Vec<u8>`.
+
+| Tecla | Sin modificadores | Alt | Ctrl | Alt+Ctrl |
+|-------|-------------------|-----|------|----------|
+| Escape | `0x1b` | `0x1b` | `0x1b` | `0x1b` |
+| Supr | `ESC[3~` | `ESC[3;3~` | `ESC[3;5~` | `ESC[3;7~` |
+
+### 12.3. Decisiones justificadas
+
+| Tema | Decisión | Alternativa descartada | Razón |
+|------|----------|------------------------|-------|
+| Escape | devolver el byte `ESC` y terminar | `ESC[[D` | RF-68: `ESC[[D` no es una secuencia estándar; `0x1b` es lo que envía xterm y lo que esperan readline/vim/nano |
+| Supr | `ESC[3~`, con el `3` antes del modificador | reutilizar el prefijo `ESC[`+modificador (`ESC[;5~`) | La forma estándar es `CSI 3 ~` / `CSI 3 ; N ~`; reutilizar el prefijo no puede expresar el `3` intermedio |
+| Código de modificador | `1 + alt*2 + ctrl*4` (alt=3, ctrl=5, ambos=7) | el orden de la rama de flechas | Es el orden xterm estándar y el que ya usa la rama `Special` para `Home`/`End` |
+| Escape con modificadores | ignora `ctrl`/`alt` | `ESC`+modificador | Escape no tiene forma `CSI`; xterm envía `0x1b` siempre |
+| Flechas | fuera de alcance | corregir también su orden de modificadores | La rama `KeyEvent::Arrow` intercambia alt/ctrl respecto al estándar; no lo cubre ningún RF (ver «Dudas abiertas») |
+
+### 12.4. Estrategia de tests
+
+| RF / CL | Tipo | Casos |
+|---------|------|-------|
+| RF-68 | Unit (`core::input`) | `Escape` ⇒ `[0x1b]`; con Alt y/o Ctrl también `[0x1b]` |
+| RF-69 | Unit (`core::input`) | `Delete` ⇒ `ESC[3~`; con Alt ⇒ `ESC[3;3~`; con Ctrl ⇒ `ESC[3;5~`; con ambos ⇒ `ESC[3;7~` |
+| CL-30 | Unit (`core::input`, `gui::event`) | no se genera `ESC[[D` ni `ESC[~`; el atajo del GUI produce `0x1b` |
+
+## 13. Shell heredada al dividir paneles (RF-70)
+
+### 13.1. Estructura de módulos
+
+| Módulo | Cambio |
+|--------|--------|
+| `terminal/src/main.rs` | `TabState.panes` pasa a `HashMap<PanelId, PaneState>`; `spawn_session` devuelve `PaneState` (sesión + shell efectiva); `split_active` hereda la shell del panel enfocado |
+
+No se toca `terminal_core` ni `terminal_config`: la herencia es política del binario (constitución 4, el core no sabe de paneles).
+
+### 13.2. Modelo de datos
+
+```rust
+// terminal/src/main.rs
+struct PaneState {
+    session: TerminalSession,
+    command: ShellCommand,  // shell que realmente corre (RF-70, CL-31)
+}
+struct TabState {
+    layout: SplitLayout,
+    panes: HashMap<PanelId, PaneState>,
+}
+impl TabState {
+    fn split_command(&self, default: &ShellCommand) -> ShellCommand;
+}
+```
+
+`spawn_session` guarda como `command` la petición si arrancó, o
+`ShellCommand::platform_default()` si hubo *fallback* (RF-67), de modo que
+`split_command` devuelve siempre la shell que corre (CL-31).
+
+### 13.3. Decisiones justificadas
+
+| Tema | Decisión | Alternativa descartada | Razón |
+|------|----------|------------------------|-------|
+| Dónde se guarda la shell | por panel (`PaneState.command`) | una sola shell por pestaña | RF-70 habla del "panel dividido"; deja la puerta abierta a paneles con distinta shell |
+| Qué se hereda | la shell efectiva (ya con *fallback*) | la shell solicitada original | CL-31: el panel nuevo debe arrancar algo que funcione; heredar la solicitada repetiría el error |
+| Forma del mapa | `PaneState { session, command }` | mapa paralelo `commands: HashMap<PanelId, …>` | Evita dos mapas que hay que mantener sincronizados |
+| Pestaña nueva | sigue usando el perfil por defecto o el perfil N (RF-62…RF-66) | heredar de la pestaña activa | Una pestaña nueva no "divide"; RF-70 solo cubre los paneles |
+| Sin panel enfocado | cae al perfil por defecto | no abrir el panel | El panel siempre existe al dividir; la rama es defensiva |
+
+### 13.4. Estrategia de tests
+
+| RF / CL | Tipo | Casos |
+|---------|------|-------|
+| RF-70 | Unit (`terminal` bin) | `TabState` cuyo panel corre la shell X ⇒ `split_command(&otra)` devuelve X, no `otra` |
+| CL-31 | Unit (`terminal` bin) | panel con shell inexistente (acaba en la del sistema, RF-67) ⇒ `split_command` devuelve la del sistema, no la inexistente |
+| RF-70 | Manual | abrir pestaña con un perfil (Ctrl+Shift+N) y dividir: el panel nuevo arranca la misma shell |
+
 
 
 

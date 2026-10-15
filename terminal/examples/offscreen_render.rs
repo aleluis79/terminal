@@ -162,7 +162,7 @@ fn main() {
     let mut non_bg = 0u32;
     let mut has_red = false;
     let mut has_light = false;
-    for px in data.chunks_exact(4) {
+    for px in data.as_chunks::<4>().0 {
         if px[0].abs_diff(bg[0]) > 12 || px[1].abs_diff(bg[1]) > 12 || px[2].abs_diff(bg[2]) > 12 {
             non_bg += 1;
         }

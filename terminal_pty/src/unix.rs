@@ -12,6 +12,7 @@
 //! ```
 
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::path::PathBuf;
 
 use nix::fcntl::{self, FcntlArg, OFlag};
 use nix::pty::openpty;
@@ -35,26 +36,32 @@ pub struct UnixPty {
     master: OwnedFd,
     /// Child PID, if the process has been spawned.
     pid: Option<Pid>,
-    /// Shell command that was executed.
+    /// Program that was executed.
     #[allow(dead_code)]
-    shell: String,
+    program: String,
     /// Exit code, if the child process has exited.
     exit_code: Option<i32>,
 }
 
 impl UnixPty {
-    /// Create a new Unix PTY and spawn the given shell.
+    /// Create a new Unix PTY and spawn the given program.
     ///
     /// Steps:
     /// 1. `openpty()` creates master/slave pair
     /// 2. `fork()` creates child process
-    /// 3. Child: `setsid()`, dups slave to stdin/stdout/stderr, then `exec()`s the shell
+    /// 3. Child: `setsid()`, dups slave to stdin/stdout/stderr, then `exec()`s the program
     /// 4. Parent: closes slave fd, sets master to non-blocking, returns
     ///
     /// # Errors
     ///
     /// Returns an error if `openpty`, `fork`, or setting non-blocking mode fails.
-    pub fn spawn(shell: &str) -> Result<Self, PtyError> {
+    pub fn spawn(program: &str, args: &[String]) -> Result<Self, PtyError> {
+        // Fail fast when the program cannot be found: `exec` runs in the child,
+        // so without this check a missing shell would only show up as a child
+        // that exits immediately and the caller could not fall back (RF-67).
+        let program_path = resolve_program(program)
+            .ok_or_else(|| PtyError::Spawn(format!("program not found: {program}")))?;
+
         // Open a new PTY (no special terminal settings needed)
         let pty =
             openpty(None, None).map_err(|e| PtyError::Spawn(format!("Failed to open PTY: {e}")))?;
@@ -94,9 +101,24 @@ impl UnixPty {
                     close(slave_fd).ok();
                 }
 
-                // Execute the shell
-                let shell_cstring = std::ffi::CString::new(shell).unwrap_or_default();
-                let _ = unistd::execv(shell_cstring.as_c_str(), &[shell_cstring.as_c_str(), c"-"]);
+                // Execute the program with its arguments as real argv entries,
+                // so they are never re-interpreted (CL-25). With no configured
+                // arguments keep the historical `sh -` invocation, which makes
+                // shells such as bash read commands from the PTY.
+                let program_cstring = std::ffi::CString::new(program).unwrap_or_default();
+                let path_cstring = std::ffi::CString::new(program_path.to_string_lossy().as_ref())
+                    .unwrap_or_default();
+                let argument_cstrings: Vec<std::ffi::CString> = args
+                    .iter()
+                    .map(|arg| std::ffi::CString::new(arg.as_str()).unwrap_or_default())
+                    .collect();
+                let mut exec_argv: Vec<&std::ffi::CStr> = Vec::with_capacity(args.len() + 2);
+                exec_argv.push(program_cstring.as_c_str());
+                exec_argv.extend(argument_cstrings.iter().map(std::ffi::CString::as_c_str));
+                if args.is_empty() {
+                    exec_argv.push(c"-");
+                }
+                let _ = unistd::execv(path_cstring.as_c_str(), &exec_argv);
 
                 // execv failed
                 std::process::exit(1);
@@ -123,7 +145,7 @@ impl UnixPty {
                 Ok(Self {
                     master,
                     pid: Some(child),
-                    shell: shell.to_string(),
+                    program: program.to_string(),
                     exit_code: None,
                 })
             }
@@ -157,7 +179,7 @@ impl UnixPty {
         Ok(Self {
             master: pty.master,
             pid: None,
-            shell: String::new(),
+            program: String::new(),
             exit_code: None,
         })
     }
@@ -176,13 +198,27 @@ impl UnixPty {
     }
 }
 
+/// Resolve `program` the way `execvp(3)` would: a name containing a slash is
+/// used as an explicit path, a bare name is looked up in `PATH`.
+fn resolve_program(program: &str) -> Option<PathBuf> {
+    if program.contains('/') {
+        let path = PathBuf::from(program);
+        return path.is_file().then_some(path);
+    }
+
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
 impl Pty for UnixPty {
-    /// Spawn a new shell process on this PTY.
-    fn spawn(shell: &str) -> Result<Self, PtyError>
+    /// Spawn a new process on this PTY.
+    fn spawn(program: &str, args: &[String]) -> Result<Self, PtyError>
     where
         Self: Sized,
     {
-        Self::spawn(shell)
+        Self::spawn(program, args)
     }
 
     /// Read data from the PTY master fd.
@@ -373,6 +409,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_resolve_program_finds_absolute_path() {
+        assert_eq!(
+            resolve_program("/bin/bash"),
+            Some(PathBuf::from("/bin/bash"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_program_uses_path_for_bare_names() {
+        // `sh` is a bare name, so it must be resolved through PATH.
+        let resolved = resolve_program("sh");
+        assert!(resolved.is_some(), "sh should be found in PATH");
+    }
+
+    #[test]
+    fn test_resolve_program_rejects_missing_program() {
+        assert_eq!(
+            resolve_program("terminal-definitely-missing-shell-xyz"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_spawn_missing_program_errors() {
+        // RF-67: a missing shell must be reported so the caller can fall back
+        // to the shell of the system instead of leaving an empty pane.
+        let result = UnixPty::spawn("terminal-definitely-missing-shell-xyz", &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_pty_create_empty() {
         let pty = UnixPty::new_empty();
         assert!(pty.is_ok());
@@ -384,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_pty_spawn() {
-        let pty = UnixPty::spawn("/bin/bash");
+        let pty = UnixPty::spawn("/bin/bash", &[]);
         assert!(pty.is_ok());
         let pty = pty.unwrap();
         assert!(pty.is_alive());
@@ -392,8 +459,39 @@ mod tests {
     }
 
     #[test]
+    fn test_pty_spawn_with_arguments() {
+        // RF-62 / CL-25: arguments are passed as real argv entries, so a
+        // multi-word argument must arrive as a single argument.
+        let mut pty = UnixPty::spawn(
+            "/bin/sh",
+            &["-c".to_string(), "printf '<%s>\\n' \"a b\"".to_string()],
+        )
+        .expect("spawn failed");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut buf = [0u8; 256];
+        let mut output = String::new();
+        for _ in 0..50 {
+            match pty.read(&mut buf) {
+                Ok(Some(0)) => {}
+                Ok(Some(n)) => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(None) => break,
+                Err(e) => panic!("read error: {e}"),
+            }
+            if output.contains('>') {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // `-c` was honoured (the command ran) and "a b" stayed one argument.
+        assert!(output.contains("<a b>"), "unexpected output: {output:?}");
+    }
+
+    #[test]
     fn test_pty_read_write() {
-        let mut pty = UnixPty::spawn("/bin/bash").expect("spawn failed");
+        let mut pty = UnixPty::spawn("/bin/bash", &[]).expect("spawn failed");
 
         // Give the shell time to start
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -433,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_pty_send_interrupt() {
-        let pty = UnixPty::spawn("/bin/bash").expect("spawn failed");
+        let pty = UnixPty::spawn("/bin/bash", &[]).expect("spawn failed");
         assert!(pty.is_alive());
 
         // Send SIGINT
@@ -446,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_pty_wait_exited() {
-        let mut pty = UnixPty::spawn("/bin/true").expect("spawn failed");
+        let mut pty = UnixPty::spawn("/bin/true", &[]).expect("spawn failed");
         assert!(pty.is_alive());
 
         // /bin/true exits immediately, wait for it
@@ -460,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_pty_pid_consistency() {
-        let pty = UnixPty::spawn("/bin/bash").expect("spawn failed");
+        let pty = UnixPty::spawn("/bin/bash", &[]).expect("spawn failed");
         let pid = pty.pid();
         assert!(pid.is_some());
         let pid = pid.unwrap();
@@ -500,7 +598,7 @@ mod tests {
     fn test_pty_reads_eof_after_child_exits() {
         // Regression: after the child's output is drained, reads must report EOF
         // so the session can surface the exit.
-        let mut pty = UnixPty::spawn("/bin/echo").expect("spawn failed");
+        let mut pty = UnixPty::spawn("/bin/echo", &[]).expect("spawn failed");
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let mut buf = [0u8; 256];
@@ -524,7 +622,7 @@ mod tests {
         // Use `cat`, which reliably exits on EOF. (An interactive `bash` may
         // ignore Ctrl+D depending on the user's `IGNOREEOF` setting, which
         // would make this test hang on `wait()`.)
-        let mut pty = UnixPty::spawn("/bin/cat").expect("spawn failed");
+        let mut pty = UnixPty::spawn("/bin/cat", &[]).expect("spawn failed");
 
         // Give the child time to start
         std::thread::sleep(std::time::Duration::from_millis(200));

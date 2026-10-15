@@ -4,12 +4,15 @@
 ///
 /// Implementations exist for Unix (fork + pts) and Windows (`ConPTY`).
 pub trait Pty: Send + 'static {
-    /// Spawn a new shell process on this PTY.
+    /// Spawn a new process on this PTY.
+    ///
+    /// `program` is the executable and `args` the arguments passed to it as
+    /// separate entries (never re-interpreted by a shell) (RF-62, CL-25).
     ///
     /// # Errors
     ///
     /// Returns an error if the PTY cannot be created or the process cannot be spawned.
-    fn spawn(shell: &str) -> Result<Self, PtyError>
+    fn spawn(program: &str, args: &[String]) -> Result<Self, PtyError>
     where
         Self: Sized;
 

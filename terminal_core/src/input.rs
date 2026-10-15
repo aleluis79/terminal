@@ -173,14 +173,21 @@ pub fn key_event_to_bytes(event: &KeyEvent) -> Vec<u8> {
             }
             match key {
                 SpecialKey::Escape => {
-                    bytes.push(b'[');
-                    bytes.push(b'D');
+                    // RF-68: Escape is a bare `ESC`; there is no `CSI` form for
+                    // it, so modifiers are ignored.
+                    return vec![0x1b];
                 }
                 SpecialKey::Backspace => {
+                    // `DEL` (0x7f) is the conventional byte for Backspace, and
+                    // the one `cmd.exe` needs: with a raw `BS` (0x08) `ConPTY`
+                    // sees Ctrl+H and makes `cmd.exe` delete the whole word
+                    // instead of a single character. `BS` is kept for the
+                    // explicit Ctrl+Backspace chord, where deleting the word is
+                    // the expected behaviour.
                     if *ctrl {
-                        return vec![0x7f];
+                        return vec![0x08];
                     }
-                    return vec![0x08];
+                    return vec![0x7f];
                 }
                 SpecialKey::Tab => {
                     if *ctrl {
@@ -199,7 +206,26 @@ pub fn key_event_to_bytes(event: &KeyEvent) -> Vec<u8> {
                     bytes.clear();
                     bytes.extend(vec![0x1b, b'[', b'6', b'~']);
                 }
-                SpecialKey::Delete => bytes.push(b'~'),
+                SpecialKey::Delete => {
+                    // RF-69: `ESC [ 3 ~`, with the modifier after the `3`
+                    // (`ESC [ 3 ; N ~`). xterm's modifier code is
+                    // `1 + alt*2 + ctrl*4`, so Alt=3, Ctrl=5, both=7. The
+                    // generic `ESC[`+modifier prefix cannot express this.
+                    bytes.clear();
+                    bytes.extend_from_slice(&[0x1b, b'[', b'3']);
+                    let mut modifier = 1u8;
+                    if *alt {
+                        modifier += 2;
+                    }
+                    if *ctrl {
+                        modifier += 4;
+                    }
+                    if modifier > 1 {
+                        bytes.push(b';');
+                        bytes.push(b'0' + modifier);
+                    }
+                    bytes.push(b'~');
+                }
                 SpecialKey::Insert => {
                     bytes.clear();
                     bytes.extend(vec![0x1b, b'[', b'2', b'~']);
@@ -389,6 +415,18 @@ mod tests {
             ctrl: false,
             alt: false,
         };
+        assert_eq!(key_event_to_bytes(&event), vec![0x7f]);
+    }
+
+    #[test]
+    fn test_ctrl_backspace() {
+        // Ctrl+Backspace keeps the control byte so that `ConPTY`/`cmd.exe`
+        // deletes the previous word.
+        let event = KeyEvent::Special {
+            key: SpecialKey::Backspace,
+            ctrl: true,
+            alt: false,
+        };
         assert_eq!(key_event_to_bytes(&event), vec![0x08]);
     }
 
@@ -429,7 +467,72 @@ mod tests {
             ctrl: false,
             alt: false,
         };
-        assert_eq!(key_event_to_bytes(&event), vec![0x1b, b'[', b'~']);
+        assert_eq!(key_event_to_bytes(&event), vec![0x1b, b'[', b'3', b'~']);
+    }
+
+    #[test]
+    fn test_delete_with_modifiers() {
+        // CL-30: the modifier goes after the `3`, so `ESC[3;N~`.
+        let alt = KeyEvent::Special {
+            key: SpecialKey::Delete,
+            ctrl: false,
+            alt: true,
+        };
+        assert_eq!(key_event_to_bytes(&alt), b"\x1b[3;3~".to_vec());
+
+        let ctrl = KeyEvent::Special {
+            key: SpecialKey::Delete,
+            ctrl: true,
+            alt: false,
+        };
+        assert_eq!(key_event_to_bytes(&ctrl), b"\x1b[3;5~".to_vec());
+
+        let both = KeyEvent::Special {
+            key: SpecialKey::Delete,
+            ctrl: true,
+            alt: true,
+        };
+        assert_eq!(key_event_to_bytes(&both), b"\x1b[3;7~".to_vec());
+    }
+
+    #[test]
+    fn test_delete_is_not_the_malformed_sequence() {
+        // CL-30: `ESC[~` is not a valid Delete.
+        let event = KeyEvent::Special {
+            key: SpecialKey::Delete,
+            ctrl: false,
+            alt: false,
+        };
+        assert_ne!(key_event_to_bytes(&event), vec![0x1b, b'[', b'~']);
+    }
+
+    #[test]
+    fn test_escape() {
+        // RF-68: Escape is a single ESC byte.
+        let event = KeyEvent::Special {
+            key: SpecialKey::Escape,
+            ctrl: false,
+            alt: false,
+        };
+        assert_eq!(key_event_to_bytes(&event), vec![0x1b]);
+    }
+
+    #[test]
+    fn test_escape_with_modifiers_is_still_esc() {
+        // RF-68 / CL-30: Escape has no CSI form, so modifiers are ignored and
+        // `ESC[[D` is never produced.
+        for (ctrl, alt) in [(true, false), (false, true), (true, true)] {
+            let event = KeyEvent::Special {
+                key: SpecialKey::Escape,
+                ctrl,
+                alt,
+            };
+            assert_eq!(
+                key_event_to_bytes(&event),
+                vec![0x1b],
+                "ctrl={ctrl} alt={alt}"
+            );
+        }
     }
 
     #[test]

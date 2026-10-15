@@ -516,7 +516,7 @@ impl Parser {
         if !self.csi_intermediates.is_empty() {
             // DECSCUSR (`ESC [ Ps SP q`) is the only sequence with an
             // intermediate byte this parser understands.
-            if self.csi_intermediates == [b' '] && final_byte == b'q' {
+            if self.csi_intermediates == *b" " && final_byte == b'q' {
                 let ps = self.csi_params.first().copied().unwrap_or(0);
                 return Parser::dispatch_decscusr(ps);
             }

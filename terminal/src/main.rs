@@ -23,8 +23,10 @@ use winit::window::WindowId;
 #[cfg(target_os = "linux")]
 use winit::platform::wayland::WindowAttributesExtWayland as _;
 
+use terminal_config::cli::{merge_cli, parse as parse_cli};
 use terminal_config::config::{ColorScheme, Config};
 use terminal_config::loader;
+use terminal_config::shell::ShellCommand;
 
 use terminal_core::engine::TerminalEngine;
 use terminal_core::input::KeyEvent as TerminalKeyEvent;
@@ -54,6 +56,10 @@ const SPLIT_GAP: u32 = 2;
 
 /// Application id / `WM_CLASS`, matched against `terminal.desktop` by the
 /// desktop shell so the window gets a name and icon (RF-60).
+#[cfg(target_os = "linux")]
+const APP_ID: &str = "terminal";
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 const APP_ID: &str = "terminal";
 
 /// Maximum time a synchronized-output window may hold the frame before it is
@@ -103,24 +109,49 @@ pub struct AppState {
     pub surface_config: std::sync::Mutex<wgpu::SurfaceConfiguration>,
 }
 
+/// One pane: its shell session plus the shell that is actually running in it.
+struct PaneState {
+    /// The session driving the pane.
+    session: TerminalSession,
+    /// Shell really running in the pane: the requested one, or the system
+    /// shell after a failed spawn (RF-67, CL-31).
+    command: ShellCommand,
+}
+
 /// Terminal state for one tab: a split layout plus a session per pane.
 struct TabState {
     /// Split tree of panes.
     layout: SplitLayout,
     /// One shell session per pane.
-    panes: HashMap<PanelId, TerminalSession>,
+    panes: HashMap<PanelId, PaneState>,
 }
 
 impl TabState {
     /// Create a tab with a single pane and its shell session.
-    fn new(rows: usize, cols: usize, cursor_style: EngineCursorShape) -> Self {
+    fn new(
+        rows: usize,
+        cols: usize,
+        cursor_style: EngineCursorShape,
+        command: &ShellCommand,
+    ) -> Self {
         let layout = SplitLayout::new();
         let mut panes = HashMap::new();
         panes.insert(
             layout.focused_panel(),
-            AppInner::spawn_session(rows, cols, cursor_style),
+            AppInner::spawn_session(rows, cols, cursor_style, command),
         );
         Self { layout, panes }
+    }
+
+    /// Shell for the pane created by splitting the focused one (RF-70).
+    ///
+    /// It is the shell that is really running in the pane being split, so the
+    /// chosen profile is kept instead of going back to the default shell. The
+    /// `default` is only used when the focused pane has no session.
+    fn split_command(&self, default: &ShellCommand) -> ShellCommand {
+        self.panes
+            .get(&self.layout.focused_panel())
+            .map_or_else(|| default.clone(), |pane| pane.command.clone())
     }
 }
 
@@ -177,6 +208,10 @@ struct AppInner {
     window_title: String,
     /// Configured cursor shape applied to new sessions.
     cursor_style: EngineCursorShape,
+    /// Shell used by new sessions and splits (RF-62).
+    default_shell: ShellCommand,
+    /// Shells pickable at runtime (RF-64, RF-66).
+    shell_profiles: Vec<ShellCommand>,
     /// Cursor blink interval in milliseconds (0 = steady cursor).
     cursor_blink_interval: u64,
     /// Window opacity in `0.0..=1.0`.
@@ -210,9 +245,14 @@ impl AppInner {
 
         // One pane session per tab; spawn the shell for the initial tab.
         let cursor_style = cursor_shape_from_config(config.cursor.style);
+        let default_shell = config.default_shell_command();
+        let shell_profiles = config.shell_commands();
         let mut tabs = HashMap::new();
         if let Some(tab) = tab_manager.active() {
-            tabs.insert(tab.id(), TabState::new(rows, cols, cursor_style));
+            tabs.insert(
+                tab.id(),
+                TabState::new(rows, cols, cursor_style, &default_shell),
+            );
         }
 
         Self {
@@ -230,6 +270,8 @@ impl AppInner {
             grid_cols: cols,
             window_title: config.window.title.clone(),
             cursor_style,
+            default_shell,
+            shell_profiles,
             cursor_blink_interval: config.cursor.blink_interval,
             window_opacity: config.window.opacity.clamp(0.0, 1.0),
             cursor_visible: true,
@@ -242,13 +284,42 @@ impl AppInner {
         }
     }
 
-    /// Spawn a shell session sized for the given screen.
-    fn spawn_session(rows: usize, cols: usize, cursor_style: EngineCursorShape) -> TerminalSession {
+    /// Spawn a session sized for the given screen, running `command`.
+    ///
+    /// If the requested shell cannot be started the error is written into the
+    /// pane and the shell of the system is started instead, so the tab is never
+    /// left empty (RF-67, CL-24). The returned [`PaneState`] remembers the shell
+    /// that really runs, which is what splits inherit (RF-70, CL-31).
+    fn spawn_session(
+        rows: usize,
+        cols: usize,
+        cursor_style: EngineCursorShape,
+        command: &ShellCommand,
+    ) -> PaneState {
         let mut session = TerminalSession::new(rows, cols);
-        let _ = session.spawn_shell(&default_shell());
+        let mut running = command.clone();
+        if let Err(error) = session.spawn_command(&command.program, &command.args) {
+            let fallback = ShellCommand::platform_default();
+            tracing::error!(
+                "Could not start shell {:?}: {error}; falling back to {:?}",
+                command.program,
+                fallback.program
+            );
+            let notice = format!(
+                "\r\n\x1b[31mterminal:\x1b[0m could not start shell \"{}\": {error}\r\n\
+                 \x1b[31mterminal:\x1b[0m falling back to \"{}\"\r\n\r\n",
+                command.program, fallback.program
+            );
+            session.feed(notice.as_bytes());
+            let _ = session.spawn_command(&fallback.program, &fallback.args);
+            running = fallback;
+        }
         // Apply the configured cursor style; OSC 22 can still override it.
         session.engine_mut().state_mut().cursor.shape = cursor_style;
-        session
+        PaneState {
+            session,
+            command: running,
+        }
     }
 
     /// ID of the active tab, if any.
@@ -270,14 +341,17 @@ impl AppInner {
     /// Get the active (focused) session.
     fn active_session(&self) -> Option<&TerminalSession> {
         let state = self.active_tab_state()?;
-        state.panes.get(&state.layout.focused_panel())
+        state
+            .panes
+            .get(&state.layout.focused_panel())
+            .map(|pane| &pane.session)
     }
 
     /// Get the active (focused) session (mutable).
     fn active_session_mut(&mut self) -> Option<&mut TerminalSession> {
         let state = self.active_tab_state_mut()?;
         let focused = state.layout.focused_panel();
-        state.panes.get_mut(&focused)
+        state.panes.get_mut(&focused).map(|pane| &mut pane.session)
     }
 
     /// Get the engine from the active session.
@@ -311,10 +385,10 @@ impl AppInner {
 
         for state in self.tabs.values_mut() {
             for (id, rect) in state.layout.rects(area, SPLIT_GAP) {
-                if let Some(session) = state.panes.get_mut(&id) {
+                if let Some(pane) = state.panes.get_mut(&id) {
                     let rows = (rect.height / cell_h).max(1) as usize;
                     let cols = (rect.width / cell_w).max(1) as usize;
-                    session.resize(rows, cols);
+                    pane.session.resize(rows, cols);
                 }
             }
         }
@@ -368,20 +442,26 @@ impl AppInner {
     }
 
     /// Split the focused pane, spawning a shell for the new one.
+    ///
+    /// The new pane inherits the shell that is running in the pane being split
+    /// (RF-70), not the default shell.
     fn split_active(&mut self, direction: SplitDirection) {
         let (rows, cols) = (self.grid_rows, self.grid_cols);
         let cursor_style = self.cursor_style;
+        let default = self.default_shell.clone();
         let Some(state) = self.active_tab_state_mut() else {
             return;
         };
 
+        let command = state.split_command(&default);
         let panel = match direction {
             SplitDirection::Horizontal => state.layout.split_horizontal(0.5),
             SplitDirection::Vertical => state.layout.split_vertical(0.5),
         };
-        state
-            .panes
-            .insert(panel, Self::spawn_session(rows, cols, cursor_style));
+        state.panes.insert(
+            panel,
+            Self::spawn_session(rows, cols, cursor_style, &command),
+        );
         tracing::info!("Split {direction:?}: new panel {panel:?}");
 
         self.resize_sessions();
@@ -421,7 +501,8 @@ impl AppInner {
         let bg = self.config.colors.primary.background.clone();
 
         for (tab_id, state) in &mut self.tabs {
-            for (panel_id, session) in &mut state.panes {
+            for (panel_id, pane) in &mut state.panes {
+                let session = &mut pane.session;
                 loop {
                     match session.poll_pty() {
                         Ok(PollResult::WouldBlock) => break,
@@ -671,8 +752,33 @@ impl AppInner {
                 tracing::info!("New tab created: {tab_id:?}");
 
                 let (rows, cols) = (self.grid_rows, self.grid_cols);
-                self.tabs
-                    .insert(tab_id, TabState::new(rows, cols, self.cursor_style));
+                let command = self.default_shell.clone();
+                self.tabs.insert(
+                    tab_id,
+                    TabState::new(rows, cols, self.cursor_style, &command),
+                );
+                self.clear_selection();
+                self.needs_redraw = true;
+            }
+            GuiAction::NewTabWithProfile(index) => {
+                let Some(command) = self.shell_profiles.get(index).cloned() else {
+                    // CL-27: no profile behind the shortcut, so no tab.
+                    tracing::warn!("No shell profile #{index}; shortcut ignored");
+                    return;
+                };
+
+                let tab_id = self.tab_manager.create_tab();
+                tracing::info!(
+                    "New tab created: {tab_id:?} with profile {} ({})",
+                    command.name,
+                    command.program
+                );
+
+                let (rows, cols) = (self.grid_rows, self.grid_cols);
+                self.tabs.insert(
+                    tab_id,
+                    TabState::new(rows, cols, self.cursor_style, &command),
+                );
                 self.clear_selection();
                 self.needs_redraw = true;
             }
@@ -820,7 +926,10 @@ impl AppInner {
             .pane_at(self.last_mouse_position)
             .map(|(id, _)| id)
             .or_else(|| self.active_tab_state().map(|s| s.layout.focused_panel()))?;
-        self.active_tab_state_mut()?.panes.get_mut(&panel)
+        self.active_tab_state_mut()?
+            .panes
+            .get_mut(&panel)
+            .map(|pane| &mut pane.session)
     }
 
     /// Text currently selected in the active pane, if any.
@@ -987,7 +1096,7 @@ impl AppInner {
                 })
                 .collect();
             for (id, rect) in tab_state.layout.rects(area, SPLIT_GAP) {
-                let Some(session) = tab_state.panes.get(&id) else {
+                let Some(session) = tab_state.panes.get(&id).map(|pane| &pane.session) else {
                     continue;
                 };
                 let engine = session.engine();
@@ -1336,18 +1445,6 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Return the shell to spawn on Unix: `$SHELL`, falling back to `/bin/bash`.
-#[cfg(unix)]
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
-}
-
-/// Return the shell to spawn on Windows: `%COMSPEC%`, falling back to `cmd.exe`.
-#[cfg(windows)]
-fn default_shell() -> String {
-    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
-}
-
 /// Parse a `#rrggbb` config color into an RGBA-ordered palette entry.
 ///
 /// [`TerminalPalette`] entries are RGBA-ordered (`r << 24 | g << 16 | b << 8 | a`),
@@ -1441,6 +1538,9 @@ fn main() {
 
     tracing::info!("Terminal emulator starting");
 
+    // CLI overrides the config file (RF-33, RF-63).
+    let cli = parse_cli();
+
     // Load configuration
     let config = match loader::load_config(&loader::find_config_path()) {
         Ok(cfg) => {
@@ -1452,6 +1552,7 @@ fn main() {
             Config::default()
         }
     };
+    let config = merge_cli(config, &cli);
 
     tracing::info!(
         "Terminal engine created: {}x{}",
@@ -1474,4 +1575,92 @@ fn main() {
 
     event_loop.run_app(&mut app).expect("Event loop error");
     // app is used inside the event loop, no need to use it after
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A program name that cannot exist, so spawning it always fails.
+    const MISSING_PROGRAM: &str = "terminal-definitely-missing-shell-xyz";
+
+    /// Read the visible screen as text, one line per row.
+    fn screen_text(session: &TerminalSession) -> String {
+        let buf = session.buffer().active();
+        let (rows, cols) = (buf.grid.rows, buf.grid.cols);
+        let mut text = String::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                text.push(buf.grid.get(row, col).c);
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn test_spawn_session_uses_the_requested_shell() {
+        // RF-62: the session runs the command it was given.
+        let command = Config::default().default_shell_command();
+        let pane = AppInner::spawn_session(24, 80, EngineCursorShape::Block, &command);
+        let session = &pane.session;
+        assert!(session.is_running());
+        assert!(session.pid().is_some());
+    }
+
+    #[test]
+    fn test_spawn_session_falls_back_to_the_default_shell() {
+        // RF-67, CL-24: a shell that cannot be started leaves the pane usable
+        // by running the shell of the system instead.
+        let command = ShellCommand::new("broken", MISSING_PROGRAM, Vec::new());
+        let pane = AppInner::spawn_session(24, 80, EngineCursorShape::Block, &command);
+        let session = &pane.session;
+
+        assert!(session.is_running());
+        assert!(session.pid().is_some());
+    }
+
+    #[test]
+    fn test_spawn_session_reports_the_error_visibly() {
+        // RF-67: the failure must be visible, not silent.
+        let command = ShellCommand::new("broken", MISSING_PROGRAM, Vec::new());
+        let pane = AppInner::spawn_session(24, 80, EngineCursorShape::Block, &command);
+
+        let text = screen_text(&pane.session);
+        assert!(
+            text.contains(MISSING_PROGRAM),
+            "expected an error notice, got: {text:?}"
+        );
+        assert!(
+            text.contains("falling back"),
+            "expected a fallback notice, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_split_inherits_the_focused_pane_shell() {
+        // RF-70: splitting keeps the shell that is already running instead of
+        // going back to the default shell.
+        let running = Config::default().default_shell_command();
+        let tab = TabState::new(24, 80, EngineCursorShape::Block, &running);
+        let other = ShellCommand::new("other", MISSING_PROGRAM, Vec::new());
+
+        let inherited = tab.split_command(&other);
+
+        assert_eq!(inherited, running);
+        assert_ne!(inherited, other);
+    }
+
+    #[test]
+    fn test_split_inherits_the_shell_that_actually_runs() {
+        // CL-31: when the chosen shell failed and the system shell took over
+        // (RF-67), the new pane inherits the shell that runs, not the broken one.
+        let broken = ShellCommand::new("broken", MISSING_PROGRAM, Vec::new());
+        let tab = TabState::new(24, 80, EngineCursorShape::Block, &broken);
+
+        let inherited = tab.split_command(&broken);
+
+        assert_eq!(inherited, ShellCommand::platform_default());
+        assert_ne!(inherited.program, MISSING_PROGRAM);
+    }
 }

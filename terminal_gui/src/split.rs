@@ -1186,7 +1186,7 @@ mod tests {
             width: 100,
             height: 40,
         };
-        assert!(layout.divider_rects(area, 2).is_empty());
+        assert_eq!(layout.divider_rects(area, 2), Vec::new());
     }
 
     #[test]
